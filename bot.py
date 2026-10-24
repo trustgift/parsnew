@@ -1,2017 +1,1632 @@
+# bot.py — казик screamsoon, .env + sqlite/postgres
+# pip install aiogram aiosqlite asyncpg python-dotenv
+
 import asyncio
+import functools
 import html
 import json
-import logging
 import os
+import random
 import re
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Optional, Union
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ============ CONFIG ИЗ ENV ============
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "screamsoon").lstrip("@")
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "screamsoonlarp").strip()
+REQUIRED_CHANNEL_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "0"))
+
+DAILY_BONUS = int(os.getenv("DAILY_BONUS", "1000"))
+SUBSCRIBE_REWARD = int(os.getenv("SUBSCRIBE_REWARD", "500"))
+START_BALANCE = int(os.getenv("START_BALANCE", "0"))
+MINES_COUNT = int(os.getenv("MINES_COUNT", "5"))
+
+DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
+DB_PATH = os.getenv("DB_PATH", "screamsoon.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PG_SSL = os.getenv("PG_SSL", "disable").lower()
+
+CURRENCY = "scream"
+
+# ============ ТЕЛЕГРАМ ПРЕМИУМ ЭМОДЗИ (ID) ============
+# Вписывай числовой custom_emoji_id нужного премиум-эмодзи в кавычки.
+# Если оставить "" (пустым) — в чат пойдет обычный смайлик.
+PREMIUM_EMOJIS = {
+    "casino":   "5431536464246634160",  # 🎰 Главный значок казика
+    "fire":     "5188487846968732572",  # 🔥 Огонь / статус Профи
+    "money":    "5240290577102152084",  # 💸 Деньги / переводы / выигрыши
+    "bag":      "5359785904535774578",  # 💼 Баланс / портфель
+    "gem":      "5427168083074628963",  # 💎 Алмаз / кристалл в минах
+    "boom":     "5469785308386041323",  # 💥 Взрыв мины
+    "bomb":     "5370692462882857093",  # 💣 Мины
+    "skull":    "5370598007962083530",  # 💀 Череп в джокере / лузер
+    "joker":    "5221929570436925455",  # 🃏 Карта джокера
+    "trophy":   "5409008750893734809",  # 🏆 Кубок / полная победа
+    "crown":    "5210952531676516344",  # 👑 Корона / статус Легенда
+    "gift":     "5199749070830197566",  # 🎁 Кейсы и ежедневный бонус
+    "dice":     "5310180170433327723",  # 🎲 Игральные кости
+    "chart_up": "5373001317042101552",  # 📈 Профит в плюс / рост множителя
+    "chart_dn": "5361748661640372834",  # 📉 Профит в минус
+    "stop":     "5240241223632954241",  # 🚫 Ограничение / предупреждение
+    "check":    "6327717992268301521",  # ✅ Успешное действие / проверка
+    "hour":     "5370561264516865667",  # ⏳ Таймер бонуса
+    "target":   "5323772968831052011",  # 🎯 Ставка
+    "cool":     "5242588152677282638",  # 😏 Смайлик подколки
+    "greedy":   "5242679150149383215",  # 🤑 Жадный смайлик с долларами
+    "chick":    "5470113903448956707",  # 🐣 Статус Новичок
+    "player":   "5235588635885054955",  # 🎲 Статус Игрок
+}
+
+
+def e(key: str, fallback: str) -> str:
+    """Генерирует HTML тег для Telegram Premium эмодзи или отдает fallback."""
+    custom_id = PREMIUM_EMOJIS.get(key, "").strip()
+    if custom_id:
+        return f'<tg-emoji id="{custom_id}">{fallback}</tg-emoji>'
+    return fallback
+
+
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN не задан в .env")
+
+# ========================================================
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatType
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
-from telethon import TelegramClient
-from telethon.errors import (
-    AuthKeyUnregisteredError,
-    FloodWaitError,
-    PasswordHashInvalidError,
-    SessionPasswordNeededError,
-)
-from telethon.tl import functions, types as tl_types
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import PeerUser
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+
+Event = Union[Message, CallbackQuery]
+
+# ==================== СЛОЙ БАЗЫ ДАННЫХ ====================
+
+import aiosqlite
+
+try:
+    import asyncpg
+    HAS_PG = True
+except ImportError:
+    HAS_PG = False
+
+_pg_pool: Optional["asyncpg.Pool"] = None
 
 
-# ============================================================
-# CONFIG (Заполни своими данными перед запуском)
-# ============================================================
-
-API_ID = 20734425                          # Твой API ID с https://my.telegram.org
-API_HASH = "f72fa8d1d63a8f984e47a115c76df123"            # Твой API Hash
-BOT_TOKEN = "8603082526:AAE9w4B7AG6C_-OkAXcDAXNW7mRibLa6N4c"          # Токен бота из @BotFather
-ADMIN_ID = 1602809044                   # Твой личный Telegram ID
-
-SESSION_NAME = "кочбратан"
-TARGET_CHAT_ID = 0                         # ID группы-форума (или привяжи через /set_target_chat)
-
-# Юзернейм бота see.tg для запросов
-RESOLVER_BOT_USERNAME = "getSendGiftsProBot"
-
-# Интервалы работы
-MONITOR_INTERVAL = 15     # Пауза между кругами сканирования (сек)
-MONITOR_PAGE_LIMIT = 2    # Сколько страниц маркета брать за раз
-MONITOR_API_DELAY = 1.2   # Пауза между запросами к MTProto маркета (сек)
-MONITOR_SEND_DELAY = 0.5  # Пауза между отправкой сообщений (сек)
-
-# Фильтры по умолчанию
-DEFAULT_MAX_NFT_GIFTS = 5       # Максимум NFT в профиле
-DEFAULT_MAX_RATING = 10         # Рейтинг строго < 10 (10 и выше отсекаются)
-DEFAULT_MIN_PRICE = 0
-DEFAULT_MAX_PRICE = 0
-DEFAULT_USERNAME_MODE = "any"   # "any" или "required"
-
-# ВАЖНО: True = отправлять лоты сразу при первом запуске (не ждать появления новых)
-SEND_EXISTING_ON_FIRST_SCAN = True
-
-GIFTS_PER_PAGE = 8
-REQUEST_PAGE_LIMIT = 20
-MAX_MANUAL_PAGES = 15
-
-OWNER_BLACKLIST_FILE = "owner_blacklist.json"
-OWNER_CACHE_FILE = "owner_cache.json"
-SENT_GIFTS_FILE = "sent_gifts.json"
-MONITOR_SETTINGS_FILE = "monitor_settings.json"
-TOPICS_CACHE_FILE = "topics_cache.json"
+def _is_pg() -> bool:
+    return DB_BACKEND == "postgres"
 
 
-# ============================================================
-# LOGGING / GLOBALS
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("gift-parser")
+def _strip_url(url: str) -> str:
+    """Убираем ?sslmode=... и лишние префиксы SQLAlchemy."""
+    if "+asyncpg" in url:
+        url = url.replace("postgresql+asyncpg://", "postgresql://")
+    if "?" in url:
+        url = url.split("?", 1)[0]
+    return url
 
 
-def validate_config():
-    errors = []
-    if not isinstance(API_ID, int) or API_ID <= 0:
-        errors.append("API_ID")
-    if not API_HASH or API_HASH.startswith("your_"):
-        errors.append("API_HASH")
-    if not BOT_TOKEN or BOT_TOKEN.startswith("your_"):
-        errors.append("BOT_TOKEN")
-    if not isinstance(ADMIN_ID, int) or ADMIN_ID <= 0:
-        errors.append("ADMIN_ID")
-    if errors:
-        raise SystemExit(
-            "\nНе заполнены настройки: " + ", ".join(errors) +
-            "\nЗаполни блок CONFIG в верхней части скрипта."
+async def _pg_init_pool():
+    global _pg_pool
+    if not HAS_PG:
+        raise SystemExit("DB_BACKEND=postgres, но asyncpg не установлен")
+    if not DATABASE_URL:
+        raise SystemExit("DATABASE_URL не задан")
+
+    # SSL отключаем, если сервер pghost.ru не держит ssl upgrade
+    if PG_SSL in ("disable", "false", "off", "0", "no"):
+        ssl_arg = False
+    elif PG_SSL in ("require", "true", "on", "1"):
+        ssl_arg = "require"
+    else:
+        ssl_arg = False
+
+    clean_url = _strip_url(DATABASE_URL)
+
+    _pg_pool = await asyncpg.create_pool(
+        clean_url,
+        min_size=1,
+        max_size=10,
+        ssl=ssl_arg,
+        command_timeout=30,
+    )
+    print(f"[pg] пул подключений создан (ssl={ssl_arg})")
+
+
+def _pg_conn():
+    return _pg_pool.acquire()
+
+
+def _convert_qmarks(sql: str) -> str:
+    out, idx = [], 0
+    for ch in sql:
+        if ch == "?":
+            idx += 1
+            out.append(f"${idx}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+async def _q(sql: str, *args) -> list:
+    if _is_pg():
+        sql_pg = _convert_qmarks(sql)
+        async with _pg_conn() as conn:
+            rows = await conn.fetch(sql_pg, *args)
+            return [dict(r) for r in rows]
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, args) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+
+async def _x(sql: str, *args) -> None:
+    if _is_pg():
+        sql_pg = _convert_qmarks(sql)
+        async with _pg_conn() as conn:
+            await conn.execute(sql_pg, *args)
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(sql, args)
+            await db.commit()
+
+
+# ==================== ТАБЛИЦЫ И СХЕМА ====================
+
+SQLITE_SCHEMA_USERS = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id      INTEGER PRIMARY KEY,
+        username     TEXT,
+        first_name   TEXT,
+        balance      INTEGER DEFAULT 0,
+        last_bonus   INTEGER DEFAULT 0,
+        sub_rewarded INTEGER DEFAULT 0,
+        total_bet    INTEGER DEFAULT 0,
+        total_won    INTEGER DEFAULT 0,
+        games_played INTEGER DEFAULT 0,
+        games_won    INTEGER DEFAULT 0,
+        max_win      INTEGER DEFAULT 0,
+        created_at   INTEGER DEFAULT (strftime('%s','now'))
+    )
+"""
+
+SQLITE_SCHEMA_GAMES = """
+    CREATE TABLE IF NOT EXISTS active_games (
+        user_id    INTEGER PRIMARY KEY,
+        game       TEXT,
+        bet        INTEGER,
+        state      TEXT,
+        created_at INTEGER
+    )
+"""
+
+PG_SCHEMA_USERS = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id      BIGINT PRIMARY KEY,
+        username     TEXT,
+        first_name   TEXT,
+        balance      BIGINT DEFAULT 0,
+        last_bonus   BIGINT DEFAULT 0,
+        sub_rewarded INTEGER DEFAULT 0,
+        total_bet    BIGINT DEFAULT 0,
+        total_won    BIGINT DEFAULT 0,
+        games_played BIGINT DEFAULT 0,
+        games_won    BIGINT DEFAULT 0,
+        max_win      BIGINT DEFAULT 0,
+        created_at   BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+    )
+"""
+
+PG_SCHEMA_GAMES = """
+    CREATE TABLE IF NOT EXISTS active_games (
+        user_id    BIGINT PRIMARY KEY,
+        game       TEXT,
+        bet        BIGINT,
+        state      TEXT,
+        created_at BIGINT
+    )
+"""
+
+
+async def init_db():
+    if _is_pg():
+        await _pg_init_pool()
+        async with _pg_conn() as conn:
+            await conn.execute(PG_SCHEMA_USERS)
+            await conn.execute(PG_SCHEMA_GAMES)
+
+        rows = await _q(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
+        )
+        existing = {r["column_name"] for r in rows}
+        needed = {
+            "username":     "TEXT",
+            "first_name":   "TEXT",
+            "balance":      "BIGINT DEFAULT 0",
+            "last_bonus":   "BIGINT DEFAULT 0",
+            "sub_rewarded": "INTEGER DEFAULT 0",
+            "total_bet":    "BIGINT DEFAULT 0",
+            "total_won":    "BIGINT DEFAULT 0",
+            "games_played": "BIGINT DEFAULT 0",
+            "games_won":    "BIGINT DEFAULT 0",
+            "max_win":      "BIGINT DEFAULT 0",
+            "created_at":   "BIGINT",
+        }
+        async with _pg_conn() as conn:
+            for col, decl in needed.items():
+                if col not in existing:
+                    await conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+                    print(f"[migrate] users.{col} добавлена")
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(SQLITE_SCHEMA_USERS)
+            await db.execute(SQLITE_SCHEMA_GAMES)
+            await db.commit()
+
+            async with db.execute("PRAGMA table_info(users)") as cur:
+                existing = {row[1] for row in await cur.fetchall()}
+            needed = {
+                "username":     "TEXT",
+                "first_name":   "TEXT",
+                "balance":      "INTEGER DEFAULT 0",
+                "last_bonus":   "INTEGER DEFAULT 0",
+                "sub_rewarded": "INTEGER DEFAULT 0",
+                "total_bet":    "INTEGER DEFAULT 0",
+                "total_won":    "INTEGER DEFAULT 0",
+                "games_played": "INTEGER DEFAULT 0",
+                "games_won":    "INTEGER DEFAULT 0",
+                "max_win":      "INTEGER DEFAULT 0",
+                "created_at":   "INTEGER",
+            }
+            for col, decl in needed.items():
+                if col not in existing:
+                    await db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+                    print(f"[migrate] users.{col} добавлена")
+            await db.commit()
+
+
+# ==================== ОПЕРАЦИИ С БАЗОЙ ====================
+
+async def get_user(user_id: int, username: Optional[str] = None,
+                   first_name: Optional[str] = None) -> dict:
+    rows = await _q("SELECT * FROM users WHERE user_id=?", user_id)
+    if not rows:
+        await _x(
+            "INSERT INTO users (user_id, username, first_name, balance) VALUES (?,?,?,?)",
+            user_id, username, first_name, START_BALANCE,
+        )
+    else:
+        row = rows[0]
+        updates, params = [], []
+        if username and row.get("username") != username:
+            updates.append("username=?"); params.append(username)
+        if first_name and row.get("first_name") != first_name:
+            updates.append("first_name=?"); params.append(first_name)
+        if updates:
+            params.append(user_id)
+            await _x(
+                f"UPDATE users SET {', '.join(updates)} WHERE user_id=?",
+                *params,
+            )
+    rows = await _q("SELECT * FROM users WHERE user_id=?", user_id)
+    return rows[0]
+
+
+async def add_balance(user_id: int, amount: int) -> None:
+    await _x("UPDATE users SET balance = balance + ? WHERE user_id=?", amount, user_id)
+
+
+async def try_deduct_balance(user_id: int, amount: int) -> bool:
+    """Атомарное списание средств с проверкой наличия нужного баланса."""
+    if amount <= 0:
+        return True
+    if _is_pg():
+        async with _pg_conn() as conn:
+            res = await conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1",
+                amount, user_id,
+            )
+            return res == "UPDATE 1"
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+                (amount, user_id, amount),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
+
+async def set_balance(user_id: int, amount: int) -> None:
+    await _x("UPDATE users SET balance=? WHERE user_id=?", amount, user_id)
+
+
+async def set_bonus_time(user_id: int, ts: int) -> None:
+    await _x("UPDATE users SET last_bonus=? WHERE user_id=?", ts, user_id)
+
+
+async def mark_sub_rewarded(user_id: int) -> None:
+    await _x("UPDATE users SET sub_rewarded=1 WHERE user_id=?", user_id)
+
+
+async def stat_bet(user_id: int, bet: int) -> None:
+    await _x(
+        "UPDATE users SET total_bet=total_bet+?, games_played=games_played+1 WHERE user_id=?",
+        bet, user_id,
+    )
+
+
+async def stat_win(user_id: int, profit: int) -> None:
+    if _is_pg():
+        await _x(
+            "UPDATE users SET total_won=total_won+?, games_won=games_won+1, "
+            "max_win = GREATEST(max_win, ?) WHERE user_id=?",
+            profit, profit, user_id,
+        )
+    else:
+        await _x(
+            "UPDATE users SET total_won=total_won+?, games_won=games_won+1, "
+            "max_win = MAX(max_win, ?) WHERE user_id=?",
+            profit, profit, user_id,
         )
 
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-BASE_GIFTS: List["BaseGift"] = []
-BASE_GIFTS_BY_ID: Dict[int, "BaseGift"] = {}
-
-OWNERS_BLACKLIST: Dict[str, str] = {}
-OWNER_CACHE: Dict[str, Dict[str, Any]] = {}
-SENT_GIFTS: Dict[str, Dict[str, Any]] = {}
-TOPICS_CACHE: Dict[str, int] = {}
-RESOLVER_CACHE: Dict[str, Dict[str, Any]] = {}
-
-topic_creation_lock = asyncio.Lock()
-resolver_bot_lock = asyncio.Lock()
-
-MONITOR_SETTINGS: Dict[str, Any] = {
-    "enabled": False,
-    "target_chat_id": TARGET_CHAT_ID,
-    "min_price": DEFAULT_MIN_PRICE,
-    "max_price": DEFAULT_MAX_PRICE,
-    "username_mode": DEFAULT_USERNAME_MODE,
-    "model_ids": [],
-    "max_owner_nft_gifts": DEFAULT_MAX_NFT_GIFTS,
-    "max_rating_level": DEFAULT_MAX_RATING,
-}
-
-monitor_task: Optional[asyncio.Task] = None
-monitor_running = False
-monitor_first_scan_done = False
-monitor_lock = asyncio.Lock()
-market_api_lock = asyncio.Lock()
-last_market_api_request = 0.0
-
-USER_SELECTED_GIFT: Dict[int, int] = {}
-
-
-# ============================================================
-# DATA CLASSES
-# ============================================================
-
-@dataclass
-class BaseGift:
-    gift_id: int
-    title: str
-    stars: int
-    availability_resale: int
-    resell_min_stars: int
-    sold_out: bool
-
-
-@dataclass
-class OwnerInfo:
-    key: str
-    label: str
-    username: Optional[str] = None
-    user_id: Optional[int] = None
-    nft_gifts_count: int = 0
-    total_gifts_count: int = 0
-    rating_level: int = 0
-    rating_stars: int = 0
-    is_multiple: bool = False
-    candidates: List[Dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def display(self) -> str:
-        if self.is_multiple and self.candidates:
-            c_names = [f"@{c['username']}" if c.get("username") else (c.get("name") or f"id:{c.get('user_id')}") for c in self.candidates[:3]]
-            return "Возможные: " + ", ".join(c_names)
-        if self.username:
-            return f"@{self.username}"
-        return self.label
-
-
-@dataclass
-class MarketGift:
-    title: str
-    num: int
-    slug: str
-    price: int
-    owner: OwnerInfo
-
-    @property
-    def link(self) -> str:
-        return f"https://t.me/nft/{self.slug}"
-
-
-# ============================================================
-# FSM STATES
-# ============================================================
-
-class AuthState(StatesGroup):
-    waiting_phone = State()
-    waiting_code = State()
-    waiting_password = State()
-
-
-class MonitorPriceState(StatesGroup):
-    waiting_range = State()
-
-
-class MonitorRatingState(StatesGroup):
-    waiting_rating = State()
-
-
-class MonitorNftLimitState(StatesGroup):
-    waiting_limit = State()
-
-
-class BlacklistState(StatesGroup):
-    waiting_value = State()
-
-
-# ============================================================
-# JSON STORAGE
-# ============================================================
-
-def load_json(path: str, default: Any) -> Any:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def save_json(path: str, data: Any) -> None:
-    try:
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception as e:
-        log.error("Save JSON error %s: %s", path, e)
-
-
-def load_owner_blacklist() -> Dict[str, str]:
-    data = load_json(OWNER_BLACKLIST_FILE, {})
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
-
-
-def save_owner_blacklist() -> None:
-    save_json(OWNER_BLACKLIST_FILE, OWNERS_BLACKLIST)
-
-
-def load_owner_cache() -> Dict[str, Dict[str, Any]]:
-    data = load_json(OWNER_CACHE_FILE, {})
-    return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
-
-
-def save_owner_cache() -> None:
-    save_json(OWNER_CACHE_FILE, OWNER_CACHE)
-
-
-def load_sent_gifts() -> Dict[str, Dict[str, Any]]:
-    data = load_json(SENT_GIFTS_FILE, {})
-    return {str(k): v if isinstance(v, dict) else {} for k, v in data.items()} if isinstance(data, dict) else {}
-
-
-def save_sent_gifts() -> None:
-    if len(SENT_GIFTS) > 5000:
-        keys_to_remove = list(SENT_GIFTS.keys())[:-4000]
-        for k in keys_to_remove:
-            SENT_GIFTS.pop(k, None)
-    save_json(SENT_GIFTS_FILE, SENT_GIFTS)
-
-
-def load_topics() -> Dict[str, int]:
-    data = load_json(TOPICS_CACHE_FILE, {})
-    return {str(k): safe_int(v) for k, v in data.items() if safe_int(v) > 0} if isinstance(data, dict) else {}
-
-
-def save_topics() -> None:
-    save_json(TOPICS_CACHE_FILE, TOPICS_CACHE)
-
-
-def load_monitor_settings() -> None:
-    global MONITOR_SETTINGS
-
-    data = load_json(MONITOR_SETTINGS_FILE, {})
-    if not isinstance(data, dict):
-        data = {}
-
-    MONITOR_SETTINGS["enabled"] = bool(data.get("enabled", False))
-    MONITOR_SETTINGS["target_chat_id"] = int(data.get("target_chat_id", TARGET_CHAT_ID) or 0)
-    MONITOR_SETTINGS["min_price"] = max(0, int(data.get("min_price", DEFAULT_MIN_PRICE) or 0))
-    MONITOR_SETTINGS["max_price"] = max(0, int(data.get("max_price", DEFAULT_MAX_PRICE) or 0))
-    MONITOR_SETTINGS["max_owner_nft_gifts"] = max(0, int(data.get("max_owner_nft_gifts", DEFAULT_MAX_NFT_GIFTS) or 0))
-    MONITOR_SETTINGS["max_rating_level"] = max(0, int(data.get("max_rating_level", DEFAULT_MAX_RATING) or 0))
-
-    username_mode = str(data.get("username_mode", DEFAULT_USERNAME_MODE)).lower()
-    MONITOR_SETTINGS["username_mode"] = username_mode if username_mode in {"any", "required"} else "any"
-
-    model_ids = data.get("model_ids", [])
-    if isinstance(model_ids, list):
-        MONITOR_SETTINGS["model_ids"] = [int(x) for x in model_ids if str(x).lstrip("-").isdigit()]
+async def save_game(user_id: int, game: str, bet: int, state: dict) -> None:
+    if _is_pg():
+        await _x(
+            """INSERT INTO active_games (user_id, game, bet, state, created_at)
+               VALUES (?,?,?,?, EXTRACT(EPOCH FROM NOW())::BIGINT)
+               ON CONFLICT (user_id) DO UPDATE SET
+                 game=EXCLUDED.game, bet=EXCLUDED.bet,
+                 state=EXCLUDED.state, created_at=EXCLUDED.created_at""",
+            user_id, game, bet, json.dumps(state),
+        )
     else:
-        MONITOR_SETTINGS["model_ids"] = []
-
-    if not MONITOR_SETTINGS["model_ids"]:
-        MONITOR_SETTINGS["enabled"] = False
-
-
-def save_monitor_settings() -> None:
-    save_json(MONITOR_SETTINGS_FILE, MONITOR_SETTINGS)
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def is_admin(user_id: Optional[int]) -> bool:
-    return bool(user_id) and user_id == ADMIN_ID
+        await _x(
+            """INSERT INTO active_games (user_id, game, bet, state, created_at)
+               VALUES (?,?,?,?, strftime('%s','now'))
+               ON CONFLICT(user_id) DO UPDATE SET
+                 game=excluded.game, bet=excluded.bet,
+                 state=excluded.state, created_at=excluded.created_at""",
+            user_id, game, bet, json.dumps(state),
+        )
 
 
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value) if value is not None else default
-    except Exception:
-        return default
-
-
-def get_field(obj: Any, name: str, default: Any = None) -> Any:
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def extract_owner_id(raw_id: Any) -> Optional[int]:
-    if raw_id is None:
+async def get_game(user_id: int) -> Optional[dict]:
+    rows = await _q("SELECT * FROM active_games WHERE user_id=?", user_id)
+    if not rows:
         return None
-    if isinstance(raw_id, int):
-        return raw_id
-    if isinstance(raw_id, PeerUser):
-        return raw_id.user_id
-    if hasattr(raw_id, "user_id"):
-        return safe_int(getattr(raw_id, "user_id"), 0) or None
-    try:
-        return int(raw_id)
-    except Exception:
+    g = rows[0]
+    # Защита от зависших игр: если прошло > 15 минут — автосброс
+    now = int(time.time())
+    if now - g.get("created_at", 0) > 900:
+        await delete_game(user_id)
         return None
+    g["state"] = json.loads(g["state"])
+    return g
 
 
-def extract_stars_amount(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, list):
-        for item in value:
-            amount = extract_stars_amount(item)
-            if amount:
-                return amount
-        return 0
-    amount = get_field(value, "amount")
-    if amount is not None:
-        return safe_int(amount)
-    stars = get_field(value, "stars")
-    if stars is not None:
-        return safe_int(stars)
-    return 0
+async def delete_game(user_id: int) -> None:
+    await _x("DELETE FROM active_games WHERE user_id=?", user_id)
 
 
-def owner_blacklist_keys(owner: OwnerInfo) -> Set[str]:
-    keys: Set[str] = set()
-    if owner.user_id:
-        keys.add(f"id:{owner.user_id}")
-    if owner.username:
-        keys.add(f"username:{owner.username.lower()}")
-    if owner.key:
-        keys.add(owner.key)
-    for c in owner.candidates:
-        if c.get("user_id"):
-            keys.add(f"id:{c['user_id']}")
-        if c.get("username"):
-            keys.add(f"username:{c['username'].lower()}")
-    return keys
+async def find_user_by_username(username: str) -> Optional[dict]:
+    rows = await _q("SELECT * FROM users WHERE username=?", username)
+    return rows[0] if rows else None
 
 
-def is_owner_blacklisted(owner: OwnerInfo) -> bool:
-    return any(key in OWNERS_BLACKLIST for key in owner_blacklist_keys(owner))
+async def give_all(amount: int) -> int:
+    await _x("UPDATE users SET balance = balance + ?", amount)
+    rows = await _q("SELECT COUNT(*) AS n FROM users")
+    return rows[0]["n"]
 
 
-def get_target_chat_id() -> int:
-    return safe_int(MONITOR_SETTINGS.get("target_chat_id"), 0)
+# ==================== ОФОРМЛЕНИЕ И UI ====================
+
+def fmt(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
 
 
-def price_matches(price: int) -> bool:
-    min_price = safe_int(MONITOR_SETTINGS.get("min_price"), 0)
-    max_price = safe_int(MONITOR_SETTINGS.get("max_price"), 0)
-    if min_price and price < min_price:
-        return False
-    if max_price and price > max_price:
-        return False
-    return True
+def progress_bar(cur: int, total: int, length: int = 10) -> str:
+    if total <= 0:
+        return "░" * length
+    filled = max(0, min(length, round(cur / total * length)))
+    return "▓" * filled + "░" * (length - filled)
 
 
-def username_matches(owner: OwnerInfo) -> bool:
-    mode = MONITOR_SETTINGS.get("username_mode", "any")
-    if mode == "required":
-        if owner.username:
-            return True
-        if owner.is_multiple and any(c.get("username") for c in owner.candidates):
-            return True
-        return False
-    return True
+def user_title(games: int, won: int) -> str:
+    if games < 5:
+        return f"{e('chick', '🐣')} Новичок"
+    wr = won / games * 100
+    if wr < 25:
+        return f"{e('skull', '💀')} Лузер"
+    if wr < 40:
+        return f"{e('player', '🎲')} Игрок"
+    if wr < 55:
+        return f"{e('casino', '🎰')} Крутой"
+    if wr < 70:
+        return f"{e('fire', '🔥')} Профи"
+    return f"{e('crown', '👑')} Легенда"
 
 
-def escape_text(value: Any) -> str:
-    return html.escape(str(value or ""))
+def home_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="🏠 Меню", callback_data="menu:home")
 
 
-# ============================================================
-# TELETHON CLIENT & RATE LIMITER
-# ============================================================
+async def show(event: Event, text: str, kb: InlineKeyboardMarkup,
+               edit: bool = True) -> None:
+    if isinstance(event, CallbackQuery):
+        if edit:
+            try:
+                await event.message.edit_text(text, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        await event.message.answer(
+            text, reply_markup=kb,
+            reply_to_message_id=event.message.message_id,
+        )
+    else:
+        await event.answer(text, reply_markup=kb)
 
-async def ensure_user_client_connected() -> None:
-    if not user_client.is_connected():
-        await user_client.connect()
+
+async def show_alert(event: CallbackQuery, text: str) -> None:
+    await event.answer(text, show_alert=True)
 
 
-async def is_user_client_authorized() -> bool:
-    await ensure_user_client_connected()
+# ==================== ПРОВЕРКА ПОДПИСКИ ====================
+
+def get_channel_handle() -> str:
+    return REQUIRED_CHANNEL.replace("https://t.me/", "").replace("t.me/", "").lstrip("@").strip()
+
+
+async def is_subscribed(user_id: int) -> bool:
+    if not REQUIRED_CHANNEL_ID:
+        return True
     try:
-        return await user_client.is_user_authorized()
-    except (AuthKeyUnregisteredError, ValueError, ConnectionError) as e:
-        log.warning("Сессия сброшена или не зарегистрирована: %s", e)
-        return False
+        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return True
 
 
-async def pace_market_api() -> None:
-    global last_market_api_request
-    async with market_api_lock:
-        now = asyncio.get_running_loop().time()
-        wait_for = MONITOR_API_DELAY - (now - last_market_api_request)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        last_market_api_request = asyncio.get_running_loop().time()
+def sub_keyboard() -> InlineKeyboardMarkup:
+    handle = get_channel_handle()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📢 Подписаться на @{handle}",
+            url=f"https://t.me/{handle}",
+        )],
+        [InlineKeyboardButton(text=f"{e('check', '✅')} Я подписался", callback_data="check_sub")],
+    ])
 
 
-# ============================================================
-# РЕЗОЛВ ВЛАДЕЛЬЦЕВ ЧЕРЕЗ @getSendGiftsProBot
-# ============================================================
-
-async def resolve_via_bot(slug: str, gift_num: int, market_owner_name: Optional[str] = None) -> Dict[str, Any]:
-    empty_result = {"is_multiple": False, "exact": None, "candidates": []}
-    if not slug:
-        return empty_result
-
-    if slug in RESOLVER_CACHE:
-        return RESOLVER_CACHE[slug]
-
-    async with resolver_bot_lock:
-        if slug in RESOLVER_CACHE:
-            return RESOLVER_CACHE[slug]
-
-        nft_link = f"https://t.me/nft/{slug}"
-        log.info("[Resolver] Отправляем лот %s (#%s) боту @%s...", slug, gift_num, RESOLVER_BOT_USERNAME)
-
-        try:
-            await ensure_user_client_connected()
-            bot_peer = await user_client.get_input_entity(RESOLVER_BOT_USERNAME)
-
-            sent_msg = await user_client.send_message(bot_peer, nft_link)
-
-            target_reply = None
-            start_time = asyncio.get_running_loop().time()
-            num_clean = str(gift_num)
-
-            # Ждём ответ именно для этого лота до 25 секунд
-            while asyncio.get_running_loop().time() - start_time < 25.0:
-                await asyncio.sleep(1.5)
-                recent_msgs = await user_client.get_messages(bot_peer, limit=4)
-                for msg in recent_msgs:
-                    if msg.id > sent_msg.id and msg.text:
-                        msg_text_clean = re.sub(r'\s+', '', msg.text)
-                        # Проверяем совпадение по слагу или номеру лота
-                        if slug.lower() in msg.text.lower() or f"#{num_clean}" in msg_text_clean or f"#{gift_num}" in msg.text:
-                            target_reply = msg
-                            break
-                        if msg.reply_to_msg_id == sent_msg.id:
-                            target_reply = msg
-                            break
-
-                if target_reply:
-                    break
-
-            if not target_reply:
-                log.warning("[Resolver] Таймаут (25с) ожидания ответа от @%s для %s", RESOLVER_BOT_USERNAME, slug)
-                RESOLVER_CACHE[slug] = empty_result
-                return empty_result
-
-            reply_text = target_reply.text or ""
-            log.info("[Resolver] Ответ получен для #%s: %s", gift_num, reply_text.replace('\n', ' ')[:160])
-
-            raw_candidates: List[Dict[str, Any]] = []
-
-            # 1. Извлечение кандидатов из сущностей ссылок
-            if target_reply.entities:
-                for ent in target_reply.entities:
-                    ent_text = reply_text[ent.offset : ent.offset + ent.length].strip()
-                    if isinstance(ent, tl_types.MessageEntityTextUrl) and ent.url:
-                        url = ent.url
-                        if "tg://user?id=" in url:
-                            uid = safe_int(url.split("id=")[-1])
-                            if uid:
-                                raw_candidates.append({"name": ent_text, "user_id": uid, "username": None})
-                        elif "t.me/" in url:
-                            u = url.split("t.me/")[-1].split("/")[0].split("?")[0].lstrip("@").strip()
-                            if u and u.lower() not in {RESOLVER_BOT_USERNAME.lower(), "getgifts", "nft"}:
-                                raw_candidates.append({"name": ent_text, "user_id": None, "username": u})
-
-                    elif isinstance(ent, tl_types.MessageEntityMentionName):
-                        uid = getattr(ent, "user_id", None)
-                        if uid:
-                            raw_candidates.append({"name": ent_text, "user_id": uid, "username": None})
-
-                    elif isinstance(ent, tl_types.MessageEntityMention):
-                        u = ent_text.lstrip("@").strip()
-                        if u and u.lower() not in {RESOLVER_BOT_USERNAME.lower(), "getgifts", "nft"}:
-                            raw_candidates.append({"name": ent_text, "user_id": None, "username": u})
-
-            # 2. Извлечение ID из [ID:7732325402]
-            id_matches = re.findall(r'\[ID:\s*(\d+)\]', reply_text, re.IGNORECASE)
-            for id_str in id_matches:
-                uid = safe_int(id_str)
-                if uid and not any(c.get("user_id") == uid for c in raw_candidates):
-                    raw_candidates.append({"name": f"id:{uid}", "user_id": uid, "username": None})
-
-            # 3. Извлечение имён из блока «Возможно владелец: ...»
-            owner_line_match = re.search(r"Возможно владелец:\s*([^\n]+)", reply_text, re.IGNORECASE)
-            if owner_line_match:
-                parts = [p.strip() for p in owner_line_match.group(1).split(",") if p.strip()]
-                for part in parts:
-                    clean_part = re.sub(r'\[ID:\s*\d+\]', '', part).strip()
-                    if clean_part and not any(clean_part.lower() == (c.get("name") or "").lower() for c in raw_candidates):
-                        raw_candidates.append({"name": clean_part, "user_id": None, "username": None})
-
-            # Дедупликация кандидатов
-            unique_candidates: List[Dict[str, Any]] = []
-            seen_keys = set()
-            for c in raw_candidates:
-                key = (c.get("user_id"), (c.get("username") or "").lower(), (c.get("name") or "").lower())
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    unique_candidates.append(c)
-
-            # 4. Сопоставление с ником маркета
-            exact_match = None
-            if market_owner_name:
-                clean_market = market_owner_name.strip().lower()
-                for c in unique_candidates:
-                    c_n = (c.get("name") or "").strip().lower()
-                    c_u = (c.get("username") or "").strip().lower()
-                    if clean_market and (clean_market == c_n or clean_market == c_u):
-                        exact_match = c
-                        log.info("[Resolver] Совпадение по имени маркета '%s' -> %s", market_owner_name, c)
-                        break
-
-            if exact_match:
-                res = {"is_multiple": False, "exact": exact_match, "candidates": [exact_match]}
-            elif len(unique_candidates) == 1:
-                res = {"is_multiple": False, "exact": unique_candidates[0], "candidates": unique_candidates}
-            elif len(unique_candidates) > 1:
-                res = {"is_multiple": True, "exact": None, "candidates": unique_candidates}
-            else:
-                res = empty_result
-
-            RESOLVER_CACHE[slug] = res
-            return res
-
-        except FloodWaitError as e:
-            log.warning("[Resolver] FloodWait: пауза %s сек.", e.seconds)
-            await asyncio.sleep(e.seconds + 1)
-        except Exception as e:
-            log.warning("Ошибка взаимодействия с @%s для %s: %s", RESOLVER_BOT_USERNAME, slug, e)
-        finally:
-            await asyncio.sleep(2.0)
-
-        RESOLVER_CACHE[slug] = empty_result
-        return empty_result
-
-
-# ============================================================
-# ПОДСЧЁТ ТОЛЬКО NFT-ПОДАРКОВ
-# ============================================================
-
-def is_nft_gift(obj: Any) -> bool:
-    gift = getattr(obj, "gift", None) or getattr(obj, "stargift", None) or obj
-
-    for target in (obj, gift):
-        cls_name = type(target).__name__.lower()
-        if "unique" in cls_name:
-            return True
-
-    for target in (obj, gift):
-        if getattr(target, "slug", None):
-            return True
-        num = getattr(target, "num", None)
-        if num is not None and num != 0:
-            return True
-        gift_num = getattr(target, "gift_num", None)
-        if gift_num is not None and gift_num != 0:
-            return True
-
+async def gate(event: Event) -> bool:
+    if await is_subscribed(event.from_user.id):
+        return True
+    handle = get_channel_handle()
+    text = (
+        f"{e('stop', '🚫')} <b>Э, стоять!</b>\n\n"
+        f"Без подписки на @{handle} казино <b>screamsoon</b> закрыто.\n"
+        f"Подпишись — и сразу получи <b>+{fmt(SUBSCRIBE_REWARD)} {CURRENCY}</b> на баланс! {e('money', '💸')}"
+    )
+    await show(event, text, sub_keyboard(), edit=False)
     return False
 
 
-async def fetch_user_nft_gifts_count(user_id: int, max_to_check: int = 10) -> int:
-    try:
-        await pace_market_api()
-        peer = await user_client.get_input_entity(user_id)
-        raw_gifts = []
+# ==================== ГЛАВНОЕ МЕНЮ ====================
 
-        if hasattr(functions.payments, "GetSavedStarGiftsRequest"):
-            try:
-                res = await user_client(
-                    functions.payments.GetSavedStarGiftsRequest(
-                        peer=peer,
-                        offset="",
-                        limit=max_to_check + 5,
-                        exclude_unlimited=True,
-                    )
-                )
-                raw_gifts = getattr(res, "gifts", []) or []
-            except TypeError:
-                res = await user_client(
-                    functions.payments.GetSavedStarGiftsRequest(
-                        peer=peer,
-                        offset="",
-                        limit=30,
-                    )
-                )
-                raw_gifts = getattr(res, "gifts", []) or []
-        elif hasattr(functions.payments, "GetUserStarGiftsRequest"):
-            res = await user_client(
-                functions.payments.GetUserStarGiftsRequest(
-                    user_id=peer,
-                    offset="",
-                    limit=30,
-                )
-            )
-            raw_gifts = getattr(res, "gifts", []) or []
-
-        return sum(1 for g in raw_gifts if is_nft_gift(g))
-
-    except FloodWaitError as e:
-        wait_time = int(e.seconds) + 1
-        log.warning("FloodWait при проверке NFT подарков: %s сек.", wait_time)
-        await asyncio.sleep(wait_time)
-        return 999
-    except Exception as e:
-        log.warning("Ошибка подсчёта NFT для %s: %s", user_id, e)
-        return 0
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎰 Мины", callback_data="menu:mines"),
+         InlineKeyboardButton(text="🃏 Джокер", callback_data="menu:joker")],
+        [InlineKeyboardButton(text="🎲 Кости (PvE)", callback_data="menu:dice"),
+         InlineKeyboardButton(text="🎁 Кейсы", callback_data="menu:cases")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
+         InlineKeyboardButton(text="🎁 Бонус", callback_data="menu:bonus")],
+        [InlineKeyboardButton(text="💸 Перевод", callback_data="menu:pay"),
+         InlineKeyboardButton(text="💎 Купить валюту", callback_data="menu:buy")],
+    ])
 
 
-async def resolve_owner_info(raw_gift: Any, slug: Optional[str] = None, gift_num: int = 0) -> OwnerInfo:
-    owner_id = extract_owner_id(get_field(raw_gift, "owner_id"))
-    owner_name = get_field(raw_gift, "owner_name")
-
-    res_username = None
-    res_name = None
-    is_multiple = False
-    candidates: List[Dict[str, Any]] = []
-
-    if not owner_id and slug:
-        bot_res = await resolve_via_bot(slug, gift_num=gift_num, market_owner_name=str(owner_name) if owner_name else None)
-        if bot_res.get("exact"):
-            exact = bot_res["exact"]
-            owner_id = exact.get("user_id")
-            res_username = exact.get("username")
-            res_name = exact.get("name")
-            is_multiple = False
-        elif bot_res.get("is_multiple"):
-            is_multiple = True
-            candidates = bot_res.get("candidates", [])
-
-    if owner_id:
-        cache_key = str(owner_id)
-        cached = OWNER_CACHE.get(cache_key)
-
-        cache_is_corrupted = (
-            cached
-            and cached.get("nft_gifts_count", 0) == 0
-            and cached.get("total_gifts_count", 0) > 0
-        )
-
-        if cached and "nft_gifts_count" in cached and "rating_level" in cached and not cache_is_corrupted:
-            username = cached.get("username") or res_username or None
-            label = cached.get("label") or (f"@{username}" if username else f"id:{owner_id}")
-            key = f"username:{username.lower()}" if username else f"id:{owner_id}"
-            return OwnerInfo(
-                key=key,
-                label=label,
-                username=username,
-                user_id=owner_id,
-                nft_gifts_count=cached.get("nft_gifts_count", 0),
-                total_gifts_count=cached.get("total_gifts_count", 0),
-                rating_level=cached.get("rating_level", 0),
-                rating_stars=cached.get("rating_stars", 0),
-                is_multiple=False,
-            )
-
-        try:
-            await ensure_user_client_connected()
-            await pace_market_api()
-
-            peer = await user_client.get_input_entity(owner_id)
-            full = await user_client(GetFullUserRequest(id=peer))
-            full_user = full.full_user
-
-            user_obj = next((u for u in full.users if u.id == owner_id), None)
-            username = getattr(user_obj, "username", None) or res_username
-            first_name = getattr(user_obj, "first_name", "") or res_name or ""
-            last_name = getattr(user_obj, "last_name", "") or ""
-            name = f"{first_name} {last_name}".strip()
-
-            label = f"@{username}" if username else (name or f"id:{owner_id}")
-            key = f"username:{username.lower()}" if username else f"id:{owner_id}"
-
-            total_gifts = getattr(full_user, "stargifts_count", None)
-            if total_gifts is None:
-                total_gifts = getattr(full_user, "gifts_count", 0)
-
-            stars_rating = getattr(full_user, "stars_rating", None)
-            rating_level = 0
-            rating_stars = 0
-            if stars_rating:
-                rating_level = safe_int(getattr(stars_rating, "level", 0))
-                rating_stars = safe_int(getattr(stars_rating, "stars", 0))
-
-            max_limit = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), DEFAULT_MAX_NFT_GIFTS)
-            nft_gifts_count = await fetch_user_nft_gifts_count(owner_id, max_to_check=max_limit + 1)
-
-            OWNER_CACHE[cache_key] = {
-                "label": label,
-                "username": username or "",
-                "user_id": owner_id,
-                "nft_gifts_count": nft_gifts_count,
-                "total_gifts_count": total_gifts,
-                "rating_level": rating_level,
-                "rating_stars": rating_stars,
-            }
-            save_owner_cache()
-
-            log.info("Профиль %s: всего=%s, NFT=%s, рейтинг=%s", label, total_gifts, nft_gifts_count, rating_level)
-
-            return OwnerInfo(
-                key=key,
-                label=label,
-                username=username,
-                user_id=owner_id,
-                nft_gifts_count=nft_gifts_count,
-                total_gifts_count=total_gifts,
-                rating_level=rating_level,
-                rating_stars=rating_stars,
-                is_multiple=False,
-            )
-
-        except FloodWaitError as e:
-            wait_time = int(e.seconds) + 1
-            log.warning("FloodWait при запросе профиля %s: %s сек.", owner_id, wait_time)
-            await asyncio.sleep(wait_time)
-            return OwnerInfo(key=f"id:{owner_id}", label=f"id:{owner_id}", user_id=owner_id)
-
-        except Exception as e:
-            log.warning("Не удалось получить профиль %s: %s", owner_id, e)
-            if res_username:
-                return OwnerInfo(
-                    key=f"username:{res_username.lower()}",
-                    label=f"@{res_username}",
-                    username=res_username,
-                    user_id=owner_id,
-                    is_multiple=False,
-                )
-            return OwnerInfo(key=f"id:{owner_id}", label=f"id:{owner_id}", user_id=owner_id)
-
-    if is_multiple and candidates:
-        first_c = candidates[0]
-        first_u = first_c.get("username")
-        first_id = first_c.get("user_id")
-        key = f"username:{first_u.lower()}" if first_u else (f"id:{first_id}" if first_id else "multiple")
-        return OwnerInfo(
-            key=key,
-            label="Возможные владельцы",
-            username=None,
-            user_id=None,
-            is_multiple=True,
-            candidates=candidates,
-        )
-
-    if res_username:
-        clean_u = res_username.lstrip("@")
-        return OwnerInfo(
-            key=f"username:{clean_u.lower()}",
-            label=f"@{clean_u}",
-            username=clean_u,
-            user_id=None,
-            is_multiple=False,
-        )
-
-    if owner_name:
-        return OwnerInfo(
-            key=f"name:{str(owner_name).lower()}",
-            label=str(owner_name),
-            username=None,
-            user_id=None,
-            is_multiple=False,
-        )
-
-    return OwnerInfo(key="unknown", label="не указан", is_multiple=False)
-
-
-# ============================================================
-# MARKETPLACE API
-# ============================================================
-
-async def get_resale_page(
-    gift_id: int,
-    offset: str = "",
-    limit: int = REQUEST_PAGE_LIMIT,
-    sort_by_price: bool = False,
-):
-    while True:
-        try:
-            await pace_market_api()
-            try:
-                return await user_client(
-                    functions.payments.GetResaleStarGiftsRequest(
-                        gift_id=gift_id,
-                        offset=offset,
-                        limit=limit,
-                        sort_by_price=sort_by_price,
-                        sort_by_num=False,
-                        stars_only=True,
-                        for_craft=False,
-                    )
-                )
-            except TypeError as e:
-                if "stars_only" in str(e) or "for_craft" in str(e):
-                    return await user_client(
-                        functions.payments.GetResaleStarGiftsRequest(
-                            gift_id=gift_id,
-                            offset=offset,
-                            limit=limit,
-                            sort_by_price=sort_by_price,
-                            sort_by_num=False,
-                        )
-                    )
-                raise
-
-        except FloodWaitError as e:
-            wait_time = int(e.seconds) + 1
-            log.warning("FloodWait на запросе маркета: %s сек.", wait_time)
-            await asyncio.sleep(wait_time)
-
-
-async def find_market_gifts(
-    gift_id: int,
-    min_price: int,
-    max_price: int,
-    need: int = 10,
-    skip_slugs: Optional[Set[str]] = None,
-    max_pages: int = MAX_MANUAL_PAGES,
-    sort_by_price: bool = True,
-) -> List[MarketGift]:
-    found: List[MarketGift] = []
-    skip_slugs = skip_slugs or set()
-    offset = ""
-    pages = 0
-
-    max_nft_gifts = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
-    max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
-
-    while len(found) < need and pages < max_pages:
-        pages += 1
-        result = await get_resale_page(
-            gift_id=gift_id,
-            offset=offset,
-            limit=REQUEST_PAGE_LIMIT,
-            sort_by_price=sort_by_price,
-        )
-
-        raw_gifts = getattr(result, "gifts", []) or []
-        if not raw_gifts:
-            break
-
-        for raw in raw_gifts:
-            slug = get_field(raw, "slug")
-            if not slug or str(slug) in skip_slugs:
-                continue
-
-            slug = str(slug)
-            num = safe_int(get_field(raw, "num"))
-            price = extract_stars_amount(get_field(raw, "resell_amount"))
-            if price < min_price or (max_price and price > max_price):
-                continue
-
-            owner = await resolve_owner_info(raw, slug=slug, gift_num=num)
-            if is_owner_blacklisted(owner):
-                continue
-
-            if not owner.is_multiple:
-                if max_nft_gifts > 0 and owner.nft_gifts_count > max_nft_gifts:
-                    continue
-                if max_rating > 0 and owner.rating_level >= max_rating:
-                    continue
-
-            base = BASE_GIFTS_BY_ID.get(gift_id)
-            base_title = base.title if base else "Gift"
-
-            found.append(
-                MarketGift(
-                    title=str(get_field(raw, "title") or base_title),
-                    num=num,
-                    slug=slug,
-                    price=price,
-                    owner=owner,
-                )
-            )
-
-            if len(found) >= need:
-                return found
-
-        offset = getattr(result, "next_offset", "") or ""
-        if not offset:
-            break
-
-    return found
-
-
-# ============================================================
-# TOPIC MANAGEMENT
-# ============================================================
-
-async def get_or_create_model_topic(chat_id: int, model_name: str) -> Optional[int]:
-    global TOPICS_CACHE
-
-    clean_name = model_name.strip()
-    if clean_name in TOPICS_CACHE:
-        return TOPICS_CACHE[clean_name]
-
-    async with topic_creation_lock:
-        if clean_name in TOPICS_CACHE:
-            return TOPICS_CACHE[clean_name]
-
-        topic_title = clean_name[:128]
-        try:
-            forum_topic = await bot.create_forum_topic(
-                chat_id=chat_id,
-                name=topic_title,
-            )
-            thread_id = forum_topic.message_thread_id
-            TOPICS_CACHE[clean_name] = thread_id
-            save_topics()
-
-            log.info("Создан топик форума '%s' [ID: %s]", topic_title, thread_id)
-            await asyncio.sleep(1.5)
-            return thread_id
-
-        except TelegramBadRequest as e:
-            log.error("Не удалось создать топик '%s': %s", topic_title, e)
-            return None
-        except Exception as e:
-            log.exception("Ошибка при создании топика: %s", e)
-            return None
-
-
-# ============================================================
-# MONITORING LOGIC
-# ============================================================
-
-async def get_monitor_models() -> List[BaseGift]:
-    await ensure_models_loaded()
-    selected = {safe_int(x, 0) for x in (MONITOR_SETTINGS.get("model_ids") or [])}
-    if not selected:
-        return []
-    return [g for g in BASE_GIFTS if g.gift_id in selected and g.availability_resale > 0]
-
-
-async def send_monitor_gift(market_gift: MarketGift, base_gift: BaseGift) -> bool:
-    target_chat_id = get_target_chat_id()
-    if not target_chat_id:
-        log.warning("Не задан TARGET_CHAT_ID для отправки!")
-        return False
-
-    model_name = base_gift.title or market_gift.title or "Остальные подарки"
-    thread_id = await get_or_create_model_topic(target_chat_id, model_name)
-
-    owner = market_gift.owner
-    num_line = f"\n🔢 <b>Номер:</b> #{market_gift.num}" if market_gift.num else ""
-
-    if owner.is_multiple and owner.candidates:
-        lines = ["👥 <b>Возможные владельцы:</b>"]
-        for idx, c in enumerate(owner.candidates, 1):
-            c_name = escape_text(c.get("name") or "Пользователь")
-            c_u = f"@{c['username']}" if c.get("username") else None
-            c_id = f"ID: <code>{c['user_id']}</code>" if c.get("user_id") else None
-            details = ", ".join(filter(None, [c_u, c_id]))
-            details_str = f" ({details})" if details else ""
-            lines.append(f"{idx}. <b>{c_name}</b>{details_str}")
-        owner_section = "\n".join(lines)
-    else:
-        owner_section = f"👤 <b>Владелец:</b> @{escape_text(owner.username)}" if owner.username else f"👤 <b>Владелец:</b> {escape_text(owner.label)}"
-
-    stats_lines = ""
-    if not owner.is_multiple and (owner.rating_level > 0 or owner.nft_gifts_count > 0):
-        r_line = f"\n👑 <b>Рейтинг Telegram:</b> Уровень {owner.rating_level} ({owner.rating_stars} ⭐)" if owner.rating_level > 0 else "\n👑 <b>Рейтинг Telegram:</b> 0"
-        nft_line = f"\n🖼 <b>NFT в профиле:</b> {owner.nft_gifts_count} шт."
-        stats_lines = f"{r_line}{nft_line}"
-
+async def render_menu(event: Event, edit: bool = True) -> None:
+    u = await get_user(event.from_user.id, event.from_user.username,
+                       event.from_user.first_name)
+    cas = e('casino', '🎰')
     text = (
-        "🚨 <b>НОВЫЙ NFT-ПОДАРОК</b>\n\n"
-        f"🎁 <b>{escape_text(market_gift.title)}</b>{num_line}\n"
-        f"💰 <b>Цена:</b> {market_gift.price} ⭐\n"
-        f"📦 <b>Модель:</b> {escape_text(base_gift.title)}\n\n"
-        f"{owner_section}"
-        f"{stats_lines}\n\n"
-        f'🔗 <a href="{escape_text(market_gift.link)}">Открыть подарок</a>'
+        f"{cas} <b>SCREAMSOON CASINO</b> {cas}\n"
+        f"└ где твои деньги плачут, а @{ADMIN_USERNAME} кайфует {e('cool', '😏')}\n\n"
+        f"👤 <b>{html.escape(event.from_user.first_name or 'anon')}</b> "
+        f"[{user_title(u['games_played'], u['games_won'])}]\n"
+        f"{e('bag', '💼')} Баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>\n\n"
+        f"👇 Выбирай, во что залететь:"
     )
-
-    keyboard_rows = []
-    if not owner.is_multiple and owner.username:
-        keyboard_rows.append([InlineKeyboardButton(text=f"💬 Написать @{owner.username}", url=f"https://t.me/{owner.username}")])
-    elif owner.is_multiple and owner.candidates:
-        for c in owner.candidates:
-            if c.get("username"):
-                u = c["username"]
-                c_name = c.get("name") or u
-                keyboard_rows.append([InlineKeyboardButton(text=f"💬 Написать {c_name} (@{u})", url=f"https://t.me/{u}")])
-
-    keyboard_rows.append([InlineKeyboardButton(text="🛒 Купить на маркете", url=market_gift.link)])
-
-    try:
-        await bot.send_message(
-            chat_id=target_chat_id,
-            text=text,
-            message_thread_id=thread_id,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-        )
-        log.info("[+] ОТПРАВЛЕНО В ЧАТ: %s #%s (%s ⭐)", market_gift.title, market_gift.num, market_gift.price)
-        return True
-    except Exception as e:
-        log.error("Failed to send alert for %s: %s", market_gift.slug, e)
-        return False
+    await show(event, text, main_menu_kb(), edit=edit)
 
 
-async def process_monitor_model(base_gift: BaseGift, first_scan: bool) -> int:
-    sent_count = 0
-    max_nft_gifts = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
-    max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
+# ==================== МИНЫ ====================
 
-    try:
-        result = await get_resale_page(
-            gift_id=base_gift.gift_id,
-            offset="",
-            limit=MONITOR_PAGE_LIMIT,
-            sort_by_price=False,
-        )
-        raw_gifts = getattr(result, "gifts", []) or []
+MINES_GRID = 5
+MINES_TOTAL = MINES_GRID * MINES_GRID
 
-        for raw in raw_gifts:
-            slug = get_field(raw, "slug")
-            if not slug or str(slug) in SENT_GIFTS:
-                continue
 
-            slug = str(slug)
-            num = safe_int(get_field(raw, "num"))
-            price = extract_stars_amount(get_field(raw, "resell_amount"))
+def mines_new_state(mines_count: int, bet: int) -> dict:
+    cells = random.sample(range(MINES_TOTAL), mines_count)
+    return {"mines": sorted(cells), "opened": [],
+            "mines_count": mines_count, "bet": bet}
 
-            # ФИЛЬТР ЦЕНЫ ПЕРВЫМ ДЕЛОМ
-            if not price_matches(price):
-                continue
 
-            owner = await resolve_owner_info(raw, slug=slug, gift_num=num)
+def mines_multiplier(mines_count: int, opened: int) -> float:
+    if opened == 0:
+        return 1.0
+    safe_total = MINES_TOTAL - mines_count
+    m = 1.0
+    for i in range(opened):
+        m *= (MINES_TOTAL - i) / (safe_total - i)
+    return round(m * 0.97, 3)
 
-            if not username_matches(owner) or is_owner_blacklisted(owner):
-                continue
 
-            if not owner.is_multiple:
-                if max_nft_gifts > 0 and owner.nft_gifts_count > max_nft_gifts:
-                    log.info("Пропуск %s: в профиле %s NFT (> %s)", slug, owner.nft_gifts_count, max_nft_gifts)
-                    continue
-
-                if max_rating > 0 and owner.rating_level >= max_rating:
-                    log.info("Пропуск %s: рейтинг %s >= порога %s", slug, owner.rating_level, max_rating)
-                    continue
-
-            market_gift = MarketGift(
-                title=str(get_field(raw, "title") or base_gift.title),
-                num=num,
-                slug=slug,
-                price=price,
-                owner=owner,
-            )
-
-            SENT_GIFTS[slug] = {
-                "title": market_gift.title,
-                "price": market_gift.price,
-                "owner": market_gift.owner.display,
-                "gift_id": base_gift.gift_id,
-            }
-
-            if first_scan and not SEND_EXISTING_ON_FIRST_SCAN:
-                SENT_GIFTS[slug]["baseline"] = True
-                continue
-
-            sent = await send_monitor_gift(market_gift, base_gift)
-            if sent:
-                await asyncio.sleep(MONITOR_SEND_DELAY)
-                sent_count += 1
+def mines_kb(uid: int, state: dict, game_over: bool = False) -> InlineKeyboardMarkup:
+    opened = set(state["opened"])
+    mines = set(state["mines"])
+    rows = []
+    for r in range(MINES_GRID):
+        row = []
+        for c in range(MINES_GRID):
+            idx = r * MINES_GRID + c
+            if idx in mines and game_over:
+                btn_txt = "💥"
+            elif idx in opened or game_over:
+                btn_txt = "💎"
             else:
-                SENT_GIFTS.pop(slug, None)
-
-    except FloodWaitError as e:
-        wait_time = int(e.seconds) + 1
-        log.warning("FloodWait в мониторе для %s: %s сек.", base_gift.title, wait_time)
-        await asyncio.sleep(wait_time)
-    except Exception as e:
-        log.exception("Ошибка проверки модели %s: %s", base_gift.title, e)
-
-    return sent_count
-
-
-async def monitor_cycle(first_scan: bool = False) -> int:
-    async with monitor_lock:
-        models = await get_monitor_models()
-        if not models:
-            return 0
-
-        total_sent = 0
-        for index, model in enumerate(models, 1):
-            if not MONITOR_SETTINGS.get("enabled"):
-                break
-            try:
-                sent = await process_monitor_model(model, first_scan)
-                total_sent += sent
-                if sent:
-                    save_sent_gifts()
-                    log.info("Монитор: %s/%s | %s | отправлено=%s", index, len(models), model.title, sent)
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.exception("Ошибка в очереди модели %s: %s", model.title, e)
-
-        if total_sent > 0 or first_scan:
-            save_sent_gifts()
-
-        return total_sent
+                btn_txt = "⬜"
+            row.append(InlineKeyboardButton(text=btn_txt, callback_data=f"mine:{uid}:{idx}"))
+        rows.append(row)
+    if not game_over and state["opened"]:
+        mult = mines_multiplier(state["mines_count"], len(opened))
+        pot = int(state["bet"] * mult)
+        rows.append([InlineKeyboardButton(
+            text=f"💰 ЗАБРАТЬ {fmt(pot)} {CURRENCY}", callback_data=f"mine:{uid}:cashout")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def monitor_loop() -> None:
-    global monitor_running, monitor_first_scan_done
-    monitor_running = True
-    monitor_first_scan_done = False
+def mines_text(state: dict, result: Optional[str] = None) -> str:
+    n = len(state["opened"])
+    mult = mines_multiplier(state["mines_count"], n)
+    pot = int(state["bet"] * mult)
+    lines = [
+        f"{e('bomb', '💣')} <b>МИНЫ (SCREAMSOON)</b>",
+        f"💥 Мин на поле: <b>{state['mines_count']}</b>",
+        f"{e('target', '🎯')} Ставка: <b>{fmt(state['bet'])} {CURRENCY}</b>",
+        f"{e('gem', '💎')} Открыто: <b>{n}</b>",
+        f"{e('chart_up', '📈')} Множитель: <b>x{mult}</b>",
+        f"💰 Заберёшь: <b>{fmt(pot)} {CURRENCY}</b>",
+    ]
+    if result:
+        lines += ["", result]
+    return "\n".join(lines)
 
-    log.info(
-        "Монитор запущен. Порог рейтинга: <%s, Макс. NFT: %s",
-        MONITOR_SETTINGS.get("max_rating_level"),
-        MONITOR_SETTINGS.get("max_owner_nft_gifts"),
+
+# ==================== ДЖОКЕР ====================
+
+JOKER_COLS = 3
+JOKER_HOUSE_EDGE = 0.97
+
+
+def joker_new_round() -> dict:
+    return {"skull": random.randint(0, JOKER_COLS - 1)}
+
+
+def joker_new_state(bet: int) -> dict:
+    return {
+        "bet": bet,
+        "rounds": [],
+        "current": joker_new_round(),
+        "current_opened": None,
+    }
+
+
+def joker_multiplier(rounds_passed: int) -> float:
+    if rounds_passed == 0:
+        return 1.0
+    m = (3 / 2) ** rounds_passed
+    return round(m * JOKER_HOUSE_EDGE, 2)
+
+
+def joker_kb(uid: int, state: dict, game_over: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    for r in state["rounds"]:
+        skull = r["skull"]
+        opened_safe = r.get("opened_safe")
+        row = []
+        for i in range(JOKER_COLS):
+            if i == skull:
+                txt = "💀"
+            elif game_over or i == opened_safe:
+                txt = "🃏"
+            else:
+                txt = "🂠"
+            row.append(InlineKeyboardButton(text=txt, callback_data=f"jok:{uid}:nothing"))
+        rows.append(row)
+
+    if not game_over:
+        opened = state.get("current_opened")
+        row = []
+        for i in range(JOKER_COLS):
+            txt = "🃏" if i == opened else "🂠"
+            row.append(InlineKeyboardButton(text=txt, callback_data=f"jok:{uid}:{i}"))
+        rows.append(row)
+    elif state.get("current") is not None:
+        cur_skull = state["current"]["skull"]
+        row = []
+        for i in range(JOKER_COLS):
+            txt = "💀" if i == cur_skull else "🃏"
+            row.append(InlineKeyboardButton(text=txt, callback_data=f"jok:{uid}:nothing"))
+        rows.append(row)
+
+    rounds_passed = len(state["rounds"])
+    if not game_over and rounds_passed > 0:
+        mult = joker_multiplier(rounds_passed)
+        pot = int(state["bet"] * mult)
+        rows.append([InlineKeyboardButton(
+            text=f"💰 ЗАБРАТЬ {fmt(pot)} {CURRENCY} (x{mult})",
+            callback_data=f"jok:{uid}:cashout")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def joker_text(state: dict, game_over: bool = False,
+               result: Optional[str] = None) -> str:
+    rounds_passed = len(state["rounds"])
+    mult = joker_multiplier(rounds_passed)
+    pot = int(state["bet"] * mult)
+    lines = [
+        f"{e('joker', '🃏')} <b>ДЖОКЕР (SCREAMSOON)</b>",
+        f"{e('target', '🎯')} Ставка: <b>{fmt(state['bet'])} {CURRENCY}</b>",
+        f"🏁 Пройдено строк: <b>{rounds_passed}</b>",
+        f"{e('chart_up', '📈')} Множитель: <b>x{mult}</b>",
+        f"💰 Заберёшь: <b>{fmt(pot)} {CURRENCY}</b>",
+    ]
+    if result:
+        lines += ["", result]
+    return "\n".join(lines)
+
+
+# ==================== КЕЙСЫ ====================
+
+CASES = {
+    "bronze": {
+        "name": "🥉 Бронза", "price": 500,
+        "items": [("0", 350), ("100", 250), ("300", 200),
+                  ("600", 130), ("1500", 50), ("5000", 18), ("25000", 2)],
+    },
+    "silver": {
+        "name": "🥈 Серебро", "price": 2500,
+        "items": [("0", 350), ("500", 220), ("1500", 200),
+                  ("3000", 150), ("7500", 60), ("25000", 15), ("100000", 5)],
+    },
+    "gold": {
+        "name": "🥇 Золото", "price": 10000,
+        "items": [("0", 420), ("2500", 220), ("7500", 180),
+                  ("15000", 120), ("40000", 45), ("120000", 10), ("500000", 5)],
+    },
+}
+
+CASE_ALIASES = {
+    "бронза": "bronze", "бронз": "bronze", "bronze": "bronze",
+    "серебро": "silver", "серебр": "silver", "silver": "silver",
+    "золото": "gold", "золот": "gold", "gold": "gold",
+}
+
+
+def open_case(key: str) -> int:
+    c = CASES[key]
+    pop = [i[0] for i in c["items"]]
+    w = [i[1] for i in c["items"]]
+    return int(random.choices(pop, weights=w, k=1)[0])
+
+
+def cases_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text=f"{c['name']} — {fmt(c['price'])} {CURRENCY}", callback_data=f"case:{k}")]
+        for k, c in CASES.items()]
+    rows.append([home_button()])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ==================== ПРОФИЛЬ ====================
+
+def profile_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[home_button()]])
+
+
+def buy_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"✍️ Написать @{ADMIN_USERNAME}",
+            url=f"https://t.me/{ADMIN_USERNAME}")],
+        [home_button()],
+    ])
+
+
+def profile_text(u: dict, name: str) -> str:
+    games = u["games_played"]
+    won = u["games_won"]
+    wr = (won / games * 100) if games else 0
+    net = u["total_won"] - u["total_bet"]
+    net_icon = e('chart_up', '📈') if net >= 0 else e('chart_dn', '📉')
+    return (
+        f"👤 <b>Профиль</b> — {html.escape(name)}\n"
+        f"└ {user_title(games, won)}\n\n"
+        f"{e('bag', '💼')} Баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>\n\n"
+        f"🎮 Игр сыграно: <b>{games}</b>\n"
+        f"{e('trophy', '🏆')} Побед: <b>{won}</b>\n"
+        f"📊 Винрейт: <b>{wr:.1f}%</b>\n"
+        f"{progress_bar(won, games)}\n\n"
+        f"{e('money', '💸')} Всего поставлено: <b>{fmt(u['total_bet'])} {CURRENCY}</b>\n"
+        f"💰 Всего выиграно: <b>{fmt(u['total_won'])} {CURRENCY}</b>\n"
+        f"🏅 Макс. выигрыш: <b>{fmt(u['max_win'])} {CURRENCY}</b>\n"
+        f"{net_icon} Чистый профит: <b>{'+' if net >= 0 else ''}{fmt(net)} {CURRENCY}</b>"
     )
 
-    try:
-        while MONITOR_SETTINGS.get("enabled"):
-            first_scan = not monitor_first_scan_done
-            selected_models = MONITOR_SETTINGS.get("model_ids") or []
-            if not selected_models:
-                MONITOR_SETTINGS["enabled"] = False
-                save_monitor_settings()
-                break
 
-            await monitor_cycle(first_scan=first_scan)
-            monitor_first_scan_done = True
-            await asyncio.sleep(max(10, MONITOR_INTERVAL))
+# ==================== ХЕНДЛЕРЫ МЕНЮ ====================
 
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.exception("Аварийное завершение цикла монитора: %s", e)
-    finally:
-        monitor_running = False
-        log.info("Монитор остановлен.")
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    if not await gate(m):
+        return
+    await get_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    await render_menu(m, edit=False)
 
 
-async def start_monitor() -> bool:
-    global monitor_task
-    if not is_admin(ADMIN_ID) or not get_target_chat_id() or not await is_user_client_authorized():
+@dp.callback_query(F.data == "menu:home")
+async def cb_home(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    await render_menu(cq, edit=True)
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "menu:profile")
+async def cb_profile(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    u = await get_user(cq.from_user.id, cq.from_user.username, cq.from_user.first_name)
+    await show(cq, profile_text(u, cq.from_user.first_name or "anon"), profile_kb())
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "menu:bonus")
+async def cb_bonus(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    u = await get_user(cq.from_user.id, cq.from_user.username, cq.from_user.first_name)
+    now = int(time.time())
+    if now - u["last_bonus"] < 86400:
+        left = 86400 - (now - u["last_bonus"])
+        h, rem = divmod(left, 3600)
+        await show(cq, f"{e('hour', '⏳')} <b>Бонус ещё не готов</b>\n\n└ Жди <b>{h}ч {rem // 60}м</b>",
+                   profile_kb())
+        await cq.answer("Рано!")
+        return
+    await add_balance(cq.from_user.id, DAILY_BONUS)
+    await set_bonus_time(cq.from_user.id, now)
+    await show(cq, f"{e('gift', '🎁')} <b>+{fmt(DAILY_BONUS)} {CURRENCY}</b>\n└ Не слей всё сразу {e('cool', '😏')}",
+               profile_kb())
+    await cq.answer(f"+{DAILY_BONUS} {CURRENCY}")
+
+
+@dp.callback_query(F.data == "menu:pay")
+async def cb_pay(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    await show(cq,
+        f"{e('money', '💸')} <b>Перевод {CURRENCY}</b>\n\n"
+        f"└ В чате: ответь на сообщение игрока и напиши <code>п 500</code>\n"
+        f"└ В лс: <code>/pay @ник 500</code>",
+        profile_kb())
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "menu:buy")
+async def cb_buy(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    await show(cq,
+        f"{e('gem', '💎')} <b>КУПИТЬ {CURRENCY.upper()}</b> {e('gem', '💎')}\n"
+        f"└ Официальная валюта казино <b>screamsoon</b>\n\n"
+        f"💰 <b>Курс обмена:</b>\n"
+        f"└ <b>10 000 {CURRENCY}</b> = <b>10 ₽</b> или <b>10 ⭐</b>\n"
+        f"└ <b>50 000 {CURRENCY}</b> = <b>45 ₽</b> или <b>45 ⭐</b>\n"
+        f"└ <b>100 000 {CURRENCY}</b> = <b>80 ₽</b> или <b>80 ⭐</b>\n\n"
+        f"✍️ Писать лично создателю: @{ADMIN_USERNAME}\n"
+        f"└ Укажи сколько валюты надо и способ оплаты\n\n"
+        f"{e('fire', '🔥')} Валюта выдается сразу после подтверждения.",
+        buy_kb())
+    await cq.answer()
+
+
+# ==================== ВЫБОР ИГР ====================
+
+@dp.callback_query(F.data == "menu:mines")
+async def cb_menu_mines(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💣 100 {CURRENCY}", callback_data="mines:new:100"),
+         InlineKeyboardButton(text=f"💣 500 {CURRENCY}", callback_data="mines:new:500")],
+        [InlineKeyboardButton(text=f"💣 1 000 {CURRENCY}", callback_data="mines:new:1000"),
+         InlineKeyboardButton(text=f"💣 5 000 {CURRENCY}", callback_data="mines:new:5000")],
+        [home_button()],
+    ])
+    await show(cq,
+        f"{e('bomb', '💣')} <b>МИНЫ (SCREAMSOON)</b>\n"
+        f"└ 5 мин на поле 5×5\n"
+        f"└ Открывай безопасные клетки, расти множитель и вовремя жми ЗАБРАТЬ!\n\n"
+        f"👇 Выбери ставку:", kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "menu:joker")
+async def cb_menu_joker(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🃏 100 {CURRENCY}", callback_data="joker:new:100"),
+         InlineKeyboardButton(text=f"🃏 500 {CURRENCY}", callback_data="joker:new:500")],
+        [InlineKeyboardButton(text=f"🃏 1 000 {CURRENCY}", callback_data="joker:new:1000"),
+         InlineKeyboardButton(text=f"🃏 5 000 {CURRENCY}", callback_data="joker:new:5000")],
+        [home_button()],
+    ])
+    await show(cq,
+        f"{e('joker', '🃏')} <b>ДЖОКЕР</b>\n"
+        f"└ В каждой строке: 2 карты Джокера и 1 Череп\n"
+        f"└ Нашёл Джокера — уровень пройден, куш растёт!\n"
+        f"└ Череп — ставка сгорает!\n\n"
+        f"👇 Выбери ставку:", kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "menu:dice")
+async def cb_menu_dice(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 100", callback_data="dice:new:100"),
+         InlineKeyboardButton(text="🎲 500", callback_data="dice:new:500")],
+        [InlineKeyboardButton(text="🎲 1 000", callback_data="dice:new:1000"),
+         InlineKeyboardButton(text="🎲 5 000", callback_data="dice:new:5000")],
+        [home_button()],
+    ])
+    await show(cq,
+        f"{e('dice', '🎲')} <b>КОСТИ (DICE BATTLE)</b>\n"
+        f"└ Ты бросаешь кубики против казино screamsoon\n"
+        f"└ У кого больше сумма очков — забирает банк (x1.95)!\n\n"
+        f"👇 Выбери ставку:", kb)
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "menu:cases")
+async def cb_menu_cases(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    await show(cq,
+        f"{e('gift', '🎁')} <b>КЕЙСЫ SCREAMSOON</b>\n"
+        f"└ Испытай удачу и забери солидный джекпот!\n\n"
+        f"👇 Выбирай кейс:", cases_kb())
+    await cq.answer()
+
+
+# ==================== ПРОЦЕСС ИГРЫ: МИНЫ ====================
+
+@dp.callback_query(F.data.startswith("mines:new:"))
+async def cb_mines_new(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    bet = int(cq.data.split(":")[2])
+    ok = await try_deduct_balance(cq.from_user.id, bet)
+    if not ok:
+        await show_alert(cq, f"❌ Недостаточно {CURRENCY} для ставки {fmt(bet)}!")
+        return
+    if await get_game(cq.from_user.id):
+        await add_balance(cq.from_user.id, bet)
+        await show_alert(cq, "У тебя уже идёт активная игра!")
+        return
+
+    await stat_bet(cq.from_user.id, bet)
+    state = mines_new_state(MINES_COUNT, bet)
+    await save_game(cq.from_user.id, "mines", bet, state)
+    await show(cq, mines_text(state), mines_kb(cq.from_user.id, state))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("mine:"))
+async def cb_mine(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    parts = cq.data.split(":")
+    owner_id = int(parts[1])
+    action = parts[2]
+
+    # Защита от чужих нажатий в беседах
+    if cq.from_user.id != owner_id:
+        await cq.answer("🚫 Это не твоя игра!", show_alert=True)
+        return
+
+    game = await get_game(owner_id)
+    if not game or game["game"] != "mines":
+        await cq.answer("Нет активной игры.")
+        return
+    state = game["state"]
+
+    if action == "cashout":
+        mult = mines_multiplier(state["mines_count"], len(state["opened"]))
+        total = int(game["bet"] * mult)
+        profit = total - game["bet"]
+        await add_balance(owner_id, total)
+        await stat_win(owner_id, profit)
+        await delete_game(owner_id)
+        result = (f"💰 <b>ЗАБРАЛ {fmt(total)} {CURRENCY}</b> (x{mult})\n"
+                  f"└ Чистый профит: <b>+{fmt(profit)} {CURRENCY}</b> {e('greedy', '🤑')}")
+        await show(cq, mines_text(state, result), mines_kb(owner_id, state, True))
+        await cq.answer("Забрано!")
+        return
+
+    idx = int(action)
+    if idx in state["opened"]:
+        await cq.answer("Уже открыто")
+        return
+
+    if idx in state["mines"]:
+        await delete_game(owner_id)
+        result = (f"{e('boom', '💥')} <b>МИНА!</b> Ты проиграл <b>{fmt(game['bet'])} {CURRENCY}</b>\n"
+                  f"└ Казино screamsoon говорит спасибо {e('skull', '💀')}")
+        await show(cq, mines_text(state, result), mines_kb(owner_id, state, True))
+        await cq.answer("Бум 💥")
+        return
+
+    state["opened"].append(idx)
+    if len(state["opened"]) == MINES_TOTAL - state["mines_count"]:
+        mult = mines_multiplier(state["mines_count"], len(state["opened"]))
+        total = int(game["bet"] * mult)
+        profit = total - game["bet"]
+        await add_balance(owner_id, total)
+        await stat_win(owner_id, profit)
+        await delete_game(owner_id)
+        result = (f"{e('trophy', '🏆')} <b>ВСЁ ПОЛЕ ЗАЧИЩЕНО!</b> Выигрыш <b>{fmt(total)} {CURRENCY}</b> (x{mult})\n"
+                  f"└ Ты легенда казика screamsoon! {e('crown', '👑')}")
+        await show(cq, mines_text(state, result), mines_kb(owner_id, state, True))
+        await cq.answer("Победа 🏆")
+        return
+
+    await save_game(owner_id, "mines", game["bet"], state)
+    await show(cq, mines_text(state), mines_kb(owner_id, state))
+    await cq.answer()
+
+
+# ==================== ПРОЦЕСС ИГРЫ: ДЖОКЕР ====================
+
+@dp.callback_query(F.data.startswith("joker:new:"))
+async def cb_joker_new(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    bet = int(cq.data.split(":")[2])
+    ok = await try_deduct_balance(cq.from_user.id, bet)
+    if not ok:
+        await show_alert(cq, f"❌ Не хватает {CURRENCY}!")
+        return
+    if await get_game(cq.from_user.id):
+        await add_balance(cq.from_user.id, bet)
+        await show_alert(cq, "У тебя уже есть незавершённая игра.")
+        return
+
+    await stat_bet(cq.from_user.id, bet)
+    state = joker_new_state(bet)
+    await save_game(cq.from_user.id, "joker", bet, state)
+    await show(cq, joker_text(state), joker_kb(cq.from_user.id, state))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("jok:"))
+async def cb_joker_pick(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    parts = cq.data.split(":")
+    owner_id = int(parts[1])
+    action = parts[2]
+
+    if cq.from_user.id != owner_id:
+        await cq.answer("🚫 Это не твоя игра!", show_alert=True)
+        return
+
+    if action == "nothing":
+        await cq.answer("Это уже пройденные строки.")
+        return
+
+    game = await get_game(owner_id)
+    if not game or game["game"] != "joker":
+        await cq.answer("Нет активной игры.")
+        return
+    state = game["state"]
+
+    if action == "cashout":
+        rounds_passed = len(state["rounds"])
+        if rounds_passed == 0:
+            await cq.answer("Сначала угадай хотя бы одну карту.")
+            return
+        mult = joker_multiplier(rounds_passed)
+        total = int(game["bet"] * mult)
+        profit = total - game["bet"]
+        await add_balance(owner_id, total)
+        await stat_win(owner_id, profit)
+        await delete_game(owner_id)
+        state["current"] = None
+        result = (f"💰 <b>ЗАБРАЛ {fmt(total)} {CURRENCY}</b> (x{mult})\n"
+                  f"└ Чистыми: <b>+{fmt(profit)} {CURRENCY}</b> {e('greedy', '🤑')}")
+        await show(cq, joker_text(state, True, result), joker_kb(owner_id, state, True))
+        await cq.answer("Забрано!")
+        return
+
+    idx = int(action)
+    if state.get("current_opened") == idx:
+        await cq.answer("Уже открыто")
+        return
+
+    skull = state["current"]["skull"]
+
+    if idx == skull:
+        state["rounds"].append({"skull": skull, "opened_safe": None})
+        state["current"] = None
+        state["current_opened"] = None
+        await delete_game(owner_id)
+        result = (f"{e('skull', '💀')} <b>ЧЕРЕП!</b> Строка {len(state['rounds'])} оказалась роковой.\n"
+                  f"└ Сгорело <b>{fmt(game['bet'])} {CURRENCY}</b>")
+        await show(cq, joker_text(state, True, result), joker_kb(owner_id, state, True))
+        await cq.answer("Череп 💀")
+        return
+
+    state["rounds"].append({"skull": skull, "opened_safe": idx})
+    state["current"] = joker_new_round()
+    state["current_opened"] = None
+
+    await save_game(owner_id, "joker", game["bet"], state)
+    await show(cq, joker_text(state), joker_kb(owner_id, state))
+    await cq.answer(f"x{joker_multiplier(len(state['rounds']))}")
+
+
+# ==================== ПРОЦЕСС ИГРЫ: КОСТИ ====================
+
+@dp.callback_query(F.data.startswith("dice:new:"))
+async def cb_dice_new(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    bet = int(cq.data.split(":")[2])
+    ok = await try_deduct_balance(cq.from_user.id, bet)
+    if not ok:
+        await show_alert(cq, f"❌ Недостаточно {CURRENCY}!")
+        return
+
+    await stat_bet(cq.from_user.id, bet)
+    user_roll = random.randint(1, 6) + random.randint(1, 6)
+    bot_roll = random.randint(1, 6) + random.randint(1, 6)
+
+    if user_roll > bot_roll:
+        win_mult = 1.95
+        win_amt = int(bet * win_mult)
+        profit = win_amt - bet
+        await add_balance(cq.from_user.id, win_amt)
+        await stat_win(cq.from_user.id, profit)
+        res = (
+            f"{e('trophy', '🎉')} <b>ПОБЕДА!</b>\n"
+            f"👤 Твои кубики: <b>{user_roll}</b>\n"
+            f"🤖 Бот screamsoon: <b>{bot_roll}</b>\n\n"
+            f"💰 Выигрыш: <b>+{fmt(win_amt)} {CURRENCY}</b> (x{win_mult})"
+        )
+    elif user_roll < bot_roll:
+        res = (
+            f"{e('skull', '💀')} <b>ПОРАЖЕНИЕ</b>\n"
+            f"👤 Твои кубики: <b>{user_roll}</b>\n"
+            f"🤖 Бот screamsoon: <b>{bot_roll}</b>\n\n"
+            f"💸 Сгорело: <b>{fmt(bet)} {CURRENCY}</b>"
+        )
+    else:
+        await add_balance(cq.from_user.id, bet)
+        res = (
+            f"🤝 <b>НИЧЬЯ!</b>\n"
+            f"👤 Твои кубики: <b>{user_roll}</b>\n"
+            f"🤖 Бот screamsoon: <b>{bot_roll}</b>\n\n"
+            f"💵 Ставка <b>{fmt(bet)} {CURRENCY}</b> возвращена!"
+        )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🎲 Ещё на {bet}", callback_data=f"dice:new:{bet}")],
+        [home_button()],
+    ])
+    await show(cq, f"{e('dice', '🎲')} <b>КОСТИ (SCREAMSOON)</b>\n\n{res}", kb)
+    await cq.answer()
+
+
+# ==================== ПРОЦЕСС ИГРЫ: КЕЙСЫ ====================
+
+@dp.callback_query(F.data.startswith("case:"))
+async def cb_case(cq: CallbackQuery):
+    if not await gate(cq):
+        return
+    key = cq.data.split(":")[1]
+    c = CASES.get(key)
+    if not c:
+        await cq.answer("Нет такого кейса.")
+        return
+
+    ok = await try_deduct_balance(cq.from_user.id, c["price"])
+    if not ok:
+        await show_alert(cq, f"❌ Не хватает {CURRENCY}. Нужно {fmt(c['price'])}.")
+        return
+
+    await stat_bet(cq.from_user.id, c["price"])
+    prize = open_case(key)
+    if prize:
+        await add_balance(cq.from_user.id, prize)
+        await stat_win(cq.from_user.id, prize - c["price"])
+        result = f"{e('trophy', '🎉')} Выпало <b>{fmt(prize)} {CURRENCY}</b>!\n└ Жирно насыпало! {e('greedy', '🤑')}"
+    else:
+        result = f"{e('skull', '💀')} <b>ПУСТО</b>\n└ Казино screamsoon забрало кейс себе."
+
+    u = await get_user(cq.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Открыть ещё", callback_data=f"case:{key}")],
+        [home_button()],
+    ])
+    await show(cq,
+        f"{c['name']} кейс — {fmt(c['price'])} {CURRENCY}\n\n{result}\n\n"
+        f"{e('bag', '💼')} Твой баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>", kb)
+    await cq.answer()
+
+
+# ==================== ЧАТ: ПЕРЕВОД РЕПЛАЕМ ====================
+
+PAY_RE = re.compile(r"^\s*(?:п|pay|перевод|перевести)\s+(\d+)\s*$", re.IGNORECASE)
+
+
+async def handle_reply_pay(m: Message) -> bool:
+    if not m.text or not m.reply_to_message:
         return False
-
-    MONITOR_SETTINGS["enabled"] = True
-    save_monitor_settings()
-
-    if monitor_task and not monitor_task.done():
+    match = PAY_RE.match(m.text)
+    if not match:
+        return False
+    if not await gate(m):
         return True
 
-    monitor_task = asyncio.create_task(monitor_loop())
+    amount = int(match.group(1))
+    if amount <= 0:
+        await m.reply("Сумма должна быть больше 0.")
+        return True
+
+    target = m.reply_to_message.from_user
+    if target.id == m.from_user.id:
+        await m.reply("Самому себе переводить нельзя 🤡")
+        return True
+    if target.is_bot:
+        await m.reply("Боту? Ты серьёзно? 🤖")
+        return True
+
+    ok = await try_deduct_balance(m.from_user.id, amount)
+    if not ok:
+        sender = await get_user(m.from_user.id)
+        await m.reply(f"💸 У тебя только <b>{fmt(sender['balance'])}</b> {CURRENCY}, "
+                      f"а ты пытаешься кинуть {fmt(amount)}.")
+        return True
+
+    await get_user(target.id, target.username, target.first_name)
+    await add_balance(target.id, amount)
+
+    await m.reply(
+        f"{e('money', '💸')} <b>{fmt(amount)} {CURRENCY}</b> успешно улетели от "
+        f"@{m.from_user.username or m.from_user.first_name} "
+        f"к @{target.username or target.first_name} {e('check', '✅')}")
     return True
 
 
-async def stop_monitor() -> None:
-    global monitor_task
-    MONITOR_SETTINGS["enabled"] = False
-    save_monitor_settings()
+# ==================== ЧАТ: БАЛАНС ====================
 
-    if monitor_task and not monitor_task.done():
-        monitor_task.cancel()
+BAL_RE = re.compile(r"^\s*(?:б|бал|баланс|bal|balance)\s*$", re.IGNORECASE)
+
+
+async def handle_chat_balance(m: Message) -> bool:
+    if not m.text or not BAL_RE.match(m.text):
+        return False
+    if not await gate(m):
+        return True
+
+    u = await get_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    await m.reply(
+        f"{e('bag', '💼')} <b>@{m.from_user.username or m.from_user.first_name}</b>, "
+        f"твой баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>"
+    )
+    return True
+
+
+# ==================== ЧАТ: ТРИГГЕРЫ И КОМАНДЫ ====================
+
+TRIGGER_RE = re.compile(
+    r"^\s*(джокер|джок|joker|мины|мина|mines|кейс|кейсы|case|кеис|кости|dice)\b(.*)$",
+    re.IGNORECASE,
+)
+
+
+async def handle_chat_trigger(m: Message) -> bool:
+    if not m.text:
+        return False
+    match = TRIGGER_RE.match(m.text)
+    if not match:
+        return False
+
+    game_word = match.group(1).lower()
+    rest = match.group(2).strip().split()
+
+    if not await gate(m):
+        return True
+
+    if game_word in ("джокер", "джок", "joker"):
+        await chat_joker(m, rest)
+    elif game_word in ("мины", "мина", "mines"):
+        await chat_mines(m, rest)
+    elif game_word in ("кейс", "кейсы", "case", "кеис"):
+        await chat_case(m, rest)
+    elif game_word in ("кости", "dice"):
+        await chat_dice(m, rest)
+    return True
+
+
+async def chat_joker(m: Message, args: list[str]):
+    if not args or not args[0].isdigit():
+        await m.reply("🃏 Формат: <code>джокер 500</code>")
+        return
+    bet = int(args[0])
+    if bet < 100:
+        await m.reply(f"🃏 Минимум 100 {CURRENCY}")
+        return
+
+    ok = await try_deduct_balance(m.from_user.id, bet)
+    if not ok:
+        u = await get_user(m.from_user.id)
+        await m.reply(f"💸 У тебя {fmt(u['balance'])} {CURRENCY}, ставишь {fmt(bet)}")
+        return
+    if await get_game(m.from_user.id):
+        await add_balance(m.from_user.id, bet)
+        await m.reply("🎮 Ты уже играешь!")
+        return
+
+    await stat_bet(m.from_user.id, bet)
+    state = joker_new_state(bet)
+    await save_game(m.from_user.id, "joker", bet, state)
+    await m.reply(
+        f"🃏 <b>@{m.from_user.username or m.from_user.first_name}</b> "
+        f"ставит <b>{fmt(bet)} {CURRENCY}</b>\n\n" + joker_text(state),
+        reply_markup=joker_kb(m.from_user.id, state))
+
+
+async def chat_mines(m: Message, args: list[str]):
+    if not args or not args[0].isdigit():
+        await m.reply("💣 Формат: <code>мины 100</code>\n└ 5 мин на поле")
+        return
+    bet = int(args[0])
+    if bet < 100:
+        await m.reply(f"💣 Минимум 100 {CURRENCY}")
+        return
+
+    ok = await try_deduct_balance(m.from_user.id, bet)
+    if not ok:
+        u = await get_user(m.from_user.id)
+        await m.reply(f"💸 У тебя только {fmt(u['balance'])} {CURRENCY}")
+        return
+    if await get_game(m.from_user.id):
+        await add_balance(m.from_user.id, bet)
+        await m.reply("🎮 Ты уже играешь!")
+        return
+
+    await stat_bet(m.from_user.id, bet)
+    state = mines_new_state(MINES_COUNT, bet)
+    await save_game(m.from_user.id, "mines", bet, state)
+    await m.reply(
+        f"💣 <b>@{m.from_user.username or m.from_user.first_name}</b> "
+        f"ставит <b>{fmt(bet)} {CURRENCY}</b>\n\n" + mines_text(state),
+        reply_markup=mines_kb(m.from_user.id, state))
+
+
+async def chat_case(m: Message, args: list[str]):
+    if not args:
+        await m.reply("🎁 Формат: <code>кейс золото</code>")
+        return
+    case_key = CASE_ALIASES.get(args[0].lower())
+    if not case_key:
+        await m.reply("🎁 Доступные кейсы: бронза / серебро / золото")
+        return
+    c = CASES[case_key]
+    ok = await try_deduct_balance(m.from_user.id, c["price"])
+    if not ok:
+        await m.reply(f"💸 {c['name']} стоит {fmt(c['price'])} {CURRENCY}")
+        return
+    await stat_bet(m.from_user.id, c["price"])
+    prize = open_case(case_key)
+    if prize:
+        await add_balance(m.from_user.id, prize)
+        await stat_win(m.from_user.id, prize - c["price"])
+        result = f"{e('trophy', '🎉')} Выпало <b>{fmt(prize)} {CURRENCY}</b>!\n└ Жирно насыпало! {e('greedy', '🤑')}"
+    else:
+        result = f"{e('skull', '💀')} <b>ПУСТО</b>"
+    new_bal = (await get_user(m.from_user.id))["balance"]
+    await m.reply(
+        f"🎁 <b>@{m.from_user.username or m.from_user.first_name}</b> "
+        f"открывает {c['name']} за {fmt(c['price'])} {CURRENCY}\n\n{result}\n\n"
+        f"{e('bag', '💼')} Баланс: <b>{fmt(new_bal)} {CURRENCY}</b>")
+
+
+async def chat_dice(m: Message, args: list[str]):
+    if not args or not args[0].isdigit():
+        await m.reply("🎲 Формат: <code>кости 500</code>")
+        return
+    bet = int(args[0])
+    if bet < 50:
+        await m.reply(f"🎲 Минимум 50 {CURRENCY}")
+        return
+
+    ok = await try_deduct_balance(m.from_user.id, bet)
+    if not ok:
+        await m.reply(f"💸 Не хватает {CURRENCY} для ставки!")
+        return
+
+    await stat_bet(m.from_user.id, bet)
+    user_roll = random.randint(1, 6) + random.randint(1, 6)
+    bot_roll = random.randint(1, 6) + random.randint(1, 6)
+
+    if user_roll > bot_roll:
+        win_mult = 1.95
+        win_amt = int(bet * win_mult)
+        profit = win_amt - bet
+        await add_balance(m.from_user.id, win_amt)
+        await stat_win(m.from_user.id, profit)
+        res = (
+            f"{e('trophy', '🎉')} <b>ПОБЕДА!</b>\n"
+            f"👤 Твои кубики: <b>{user_roll}</b>\n"
+            f"🤖 Бот screamsoon: <b>{bot_roll}</b>\n\n"
+            f"💰 Выигрыш: <b>+{fmt(win_amt)} {CURRENCY}</b> (x{win_mult})"
+        )
+    elif user_roll < bot_roll:
+        res = (
+            f"{e('skull', '💀')} <b>ПОРАЖЕНИЕ</b>\n"
+            f"👤 Твои кубики: <b>{user_roll}</b>\n"
+            f"🤖 Бот screamsoon: <b>{bot_roll}</b>\n\n"
+            f"💸 Сгорело: <b>{fmt(bet)} {CURRENCY}</b>"
+        )
+    else:
+        await add_balance(m.from_user.id, bet)
+        res = (
+            f"🤝 <b>НИЧЬЯ!</b>\n"
+            f"👤 Твои кубики: <b>{user_roll}</b>\n"
+            f"🤖 Бот screamsoon: <b>{bot_roll}</b>\n\n"
+            f"💵 Ставка <b>{fmt(bet)} {CURRENCY}</b> возвращена!"
+        )
+
+    await m.reply(f"{e('dice', '🎲')} <b>КОСТИ (SCREAMSOON)</b>\n\n{res}")
+
+
+# ==================== КОМАНДА /PAY ====================
+
+@dp.message(Command("pay"))
+async def cmd_pay(m: Message):
+    if not await gate(m):
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 3 or not parts[2].isdigit():
+        await m.answer("Формат: <code>/pay @ник сумма</code>")
+        return
+    target_username = parts[1].lstrip("@")
+    amount = int(parts[2])
+    if amount <= 0:
+        await m.answer("Сумма должна быть > 0.")
+        return
+
+    ok = await try_deduct_balance(m.from_user.id, amount)
+    if not ok:
+        await m.answer(f"❌ Недостаточно {CURRENCY}.")
+        return
+
+    target = await find_user_by_username(target_username)
+    if not target:
+        await add_balance(m.from_user.id, amount)
+        await m.answer("❌ Получатель не найден (ему нужно хотя бы раз открыть бота).")
+        return
+    if target["user_id"] == m.from_user.id:
+        await add_balance(m.from_user.id, amount)
+        await m.answer("Себе переводить нельзя!")
+        return
+
+    await add_balance(target["user_id"], amount)
+    await m.answer(f"{e('check', '✅')} Переведено <b>{fmt(amount)} {CURRENCY}</b> пользователю @{target_username}")
+
+
+# ==================== АДМИН-КОМАНДЫ ====================
+
+def is_admin(m: Message) -> bool:
+    return m.from_user.id == ADMIN_ID
+
+
+async def resolve_target_id(arg: str) -> Optional[int]:
+    if arg.startswith("@") or not arg.lstrip("-").isdigit():
+        username = arg.lstrip("@")
+        target = await find_user_by_username(username)
+        return target["user_id"] if target else None
+    return int(arg)
+
+
+@dp.message(Command("give"))
+async def cmd_give(m: Message):
+    if not is_admin(m):
+        return
+    parts = (m.text or "").split()
+
+    if m.reply_to_message and len(parts) == 2:
+        target = m.reply_to_message.from_user
         try:
-            await monitor_task
-        except asyncio.CancelledError:
+            amount = int(parts[1])
+        except ValueError:
+            await m.answer("Формат: реплай + <code>/give 5000</code>")
+            return
+        await get_user(target.id, target.username, target.first_name)
+        await add_balance(target.id, amount)
+        await m.answer(f"✅ @{target.username or target.first_name}: <b>{amount:+}</b> {CURRENCY}")
+        try:
+            await bot.send_message(target.id, f"💰 Администратор начислил тебе <b>{fmt(amount)} {CURRENCY}</b>")
+        except Exception:
             pass
-    monitor_task = None
-
-
-# ============================================================
-# MODELS LOADER
-# ============================================================
-
-async def load_base_gifts() -> List[BaseGift]:
-    global BASE_GIFTS, BASE_GIFTS_BY_ID
-    log.info("Загрузка моделей подарков с маркета...")
-    try:
-        await ensure_user_client_connected()
-        if not await user_client.is_user_authorized():
-            return []
-
-        result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
-        raw_gifts = getattr(result, "gifts", []) or []
-
-        gifts: List[BaseGift] = []
-        for raw in raw_gifts:
-            gift_id = safe_int(get_field(raw, "id"))
-            title = get_field(raw, "title")
-            availability_resale = safe_int(get_field(raw, "availability_resale"))
-            resell_min_stars = safe_int(get_field(raw, "resell_min_stars"))
-
-            if not gift_id or not title or availability_resale <= 0:
-                continue
-
-            gifts.append(
-                BaseGift(
-                    gift_id=gift_id,
-                    title=str(title),
-                    stars=safe_int(get_field(raw, "stars")),
-                    availability_resale=availability_resale,
-                    resell_min_stars=resell_min_stars,
-                    sold_out=bool(get_field(raw, "sold_out")),
-                )
-            )
-
-        gifts.sort(key=lambda g: (g.resell_min_stars or 999999999, g.title.lower()))
-        BASE_GIFTS = gifts
-        BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
-        log.info("Успешно загружено %s моделей.", len(gifts))
-        return gifts
-    except Exception as e:
-        log.exception("Ошибка загрузки моделей: %s", e)
-        return []
-
-
-async def ensure_models_loaded() -> None:
-    if not BASE_GIFTS:
-        await load_base_gifts()
-
-
-# ============================================================
-# UI & HANDLERS
-# ============================================================
-
-def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_menu")],
-        [InlineKeyboardButton(text="🔎 РУЧНОЙ ПОИСК", callback_data="manual_parse")],
-        [InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="blacklist")],
-    ]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
-    rows.append([InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def monitor_keyboard() -> InlineKeyboardMarkup:
-    enabled = bool(MONITOR_SETTINGS.get("enabled"))
-    rows = []
-
-    if enabled:
-        rows.append([InlineKeyboardButton(text="⏸ ОСТАНОВИТЬ", callback_data="monitor_stop")])
-    else:
-        rows.append([InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ", callback_data="monitor_start")])
-
-    rows.extend([
-        [
-            InlineKeyboardButton(text="💰 ЦЕНА", callback_data="monitor_price"),
-            InlineKeyboardButton(text="👑 РЕЙТИНГ", callback_data="monitor_rating"),
-        ],
-        [
-            InlineKeyboardButton(text="🖼 NFT ЛИМИТ", callback_data="monitor_nft_limit"),
-            InlineKeyboardButton(text="👤 USERNAME", callback_data="monitor_username"),
-        ],
-        [InlineKeyboardButton(text="🎁 ВЫБОР МОДЕЛЕЙ", callback_data="monitor_models")],
-        [InlineKeyboardButton(text="🧹 СБРОСИТЬ ОТПРАВЛЕННЫЕ", callback_data="sent_clear")],
-        [InlineKeyboardButton(text="🏠 ГЛАВНОЕ МЕНЮ", callback_data="menu")],
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def monitor_status_text() -> str:
-    enabled = bool(MONITOR_SETTINGS.get("enabled"))
-    target = get_target_chat_id()
-    min_price = safe_int(MONITOR_SETTINGS.get("min_price"), 0)
-    max_price = safe_int(MONITOR_SETTINGS.get("max_price"), 0)
-    max_rating = safe_int(MONITOR_SETTINGS.get("max_rating_level"), 0)
-    max_nft = safe_int(MONITOR_SETTINGS.get("max_owner_nft_gifts"), 0)
-
-    if min_price and max_price:
-        price_text = f"{min_price}—{max_price} ⭐"
-    elif max_price:
-        price_text = f"до {max_price} ⭐"
-    elif min_price:
-        price_text = f"от {min_price} ⭐"
-    else:
-        price_text = "без ограничения"
-
-    username_text = "только с username" if MONITOR_SETTINGS.get("username_mode") == "required" else "все"
-    selected_models = MONITOR_SETTINGS.get("model_ids") or []
-    model_text = "все модели" if not selected_models else f"{len(selected_models)} выбранных"
-    target_text = str(target) if target else "❌ не задана"
-
-    rating_info = f"до {max_rating} уровня (строго < {max_rating})" if max_rating > 0 else "выключен"
-    nft_info = f"максимум {max_nft} шт." if max_nft > 0 else "выключен"
-
-    return (
-        "📡 <b>АВТОМАТИЧЕСКИЙ МОНИТОРИНГ</b>\n\n"
-        f"Статус: {'🟢 РАБОТАЕТ' if enabled else '🔴 ОСТАНОВЛЕН'}\n"
-        f"Целевая группа: <code>{escape_text(target_text)}</code>\n"
-        f"Диапазон цены: <b>{escape_text(price_text)}</b>\n"
-        f"Фильтр рейтинга: <b>{escape_text(rating_info)}</b>\n"
-        f"NFT-подарков в профиле: <b>{escape_text(nft_info)}</b>\n"
-        f"Фильтр юзернеймов: <b>{escape_text(username_text)}</b>\n"
-        f"Модели: <b>{escape_text(model_text)}</b>\n"
-        f"Интервал обхода: <b>{MONITOR_INTERVAL} сек.</b>\n"
-        f"Отправлено лотов: <b>{len(SENT_GIFTS)}</b> | Создано тем: <b>{len(TOPICS_CACHE)}</b>\n\n"
-        "💡 Для привязки группы напиши команду <code>/set_target_chat</code> прямо в ней."
-    )
-
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    if not await is_user_client_authorized():
-        if is_admin(user_id):
-            await message.answer(
-                "⚠️ Сессия Telethon не подключена.\nНажми /add_session",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]]
-                ),
-            )
-        else:
-            await message.answer("⚠️ Бот настраивается администратором.")
         return
 
-    await ensure_models_loaded()
-    await message.answer(
-        "🎁 <b>NFT GIFT MONITOR BOT</b>\n\nВыбери нужный раздел:",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(user_id),
-    )
-
-
-@dp.callback_query(F.data == "menu")
-async def menu(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🎁 <b>NFT GIFT MONITOR BOT</b>\n\nВыбери нужный раздел:",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(callback.from_user.id),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "monitor_menu")
-async def monitor_menu(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для администратора.", show_alert=True)
+    if len(parts) != 3:
+        await m.answer(
+            "Формат:\n"
+            "└ <code>/give user_id 5000</code>\n"
+            "└ <code>/give @username 5000</code>\n"
+            "└ реплай + <code>/give 5000</code>")
         return
-
-    await callback.message.edit_text(
-        monitor_status_text(),
-        parse_mode="HTML",
-        reply_markup=monitor_keyboard(),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "monitor_start")
-async def monitor_start_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    if not get_target_chat_id():
-        await callback.answer("Сначала привяжи группу через /set_target_chat", show_alert=True)
-        return
-    if not await is_user_client_authorized():
-        await callback.answer("Сессия не авторизована.", show_alert=True)
-        return
-    if not MONITOR_SETTINGS.get("model_ids"):
-        await callback.answer("Выбери хотя бы 1 модель в меню 🎁 ВЫБОР МОДЕЛЕЙ", show_alert=True)
-        return
-
-    await start_monitor()
-    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-    await callback.answer("🟢 Мониторинг запущен.")
-
-
-@dp.callback_query(F.data == "monitor_stop")
-async def monitor_stop_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await stop_monitor()
-    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-    await callback.answer("⏸ Мониторинг остановлен.")
-
-
-@dp.callback_query(F.data == "monitor_username")
-async def monitor_username_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    current = MONITOR_SETTINGS.get("username_mode", "any")
-    MONITOR_SETTINGS["username_mode"] = "required" if current == "any" else "any"
-    save_monitor_settings()
-    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "monitor_price")
-async def monitor_price_callback(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(MonitorPriceState.waiting_range)
-    await callback.message.answer("💰 Отправь диапазон цены (например: <code>0 5000</code>)\n❌ Отмена — /cancel", parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.message(MonitorPriceState.waiting_range)
-async def monitor_price_input(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").strip().replace("-", " ").split()
-    if len(parts) != 2:
-        await message.answer("❌ Введи два числа через пробел, например: <code>0 5000</code>", parse_mode="HTML")
+    target_id = await resolve_target_id(parts[1])
+    if not target_id:
+        await m.answer("❌ Юзер не найден")
         return
     try:
-        min_p, max_p = int(parts[0]), int(parts[1])
-        if min_p < 0 or max_p < 0 or (min_p and max_p and min_p > max_p):
-            raise ValueError
+        amount = int(parts[2])
     except ValueError:
-        await message.answer("❌ Некорректный диапазон.")
+        await m.answer("Сумма должна быть числом")
         return
-
-    MONITOR_SETTINGS["min_price"] = min_p
-    MONITOR_SETTINGS["max_price"] = max_p
-    save_monitor_settings()
-    await state.clear()
-    await message.answer(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-
-
-@dp.callback_query(F.data == "monitor_rating")
-async def monitor_rating_callback(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(MonitorRatingState.waiting_rating)
-    await callback.message.answer(
-        "👑 <b>Настройка фильтра рейтинга Telegram</b>\n\n"
-        "Введи максимальный уровень рейтинга продавца.\n"
-        "• <code>10</code> — парсим тех, у кого рейтинг <b>строго меньше 10</b>.\n"
-        "• <code>0</code> — отключить проверку рейтинга.\n\n"
-        "❌ Отмена — /cancel",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.message(MonitorRatingState.waiting_rating)
-async def monitor_rating_input(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("❌ Отправь одно целое число (например, <code>10</code> или <code>0</code>).", parse_mode="HTML")
-        return
-
-    val = int(text)
-    MONITOR_SETTINGS["max_rating_level"] = val
-    save_monitor_settings()
-    await state.clear()
-    await message.answer(
-        f"✅ Фильтр рейтинга сохранён: <b>{'уровень < ' + str(val) if val > 0 else 'отключен'}</b>",
-        parse_mode="HTML",
-    )
-    await message.answer(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-
-
-@dp.callback_query(F.data == "monitor_nft_limit")
-async def monitor_nft_limit_callback(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(MonitorNftLimitState.waiting_limit)
-    await callback.message.answer(
-        "🖼 <b>Максимум NFT-подарков в профиле</b>\n\n"
-        "• <code>5</code> — пропускать тех, у кого в профиле больше 5 NFT.\n"
-        "• <code>0</code> — выключить фильтр.\n\n"
-        "❌ Отмена — /cancel",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.message(MonitorNftLimitState.waiting_limit)
-async def monitor_nft_limit_input(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("❌ Отправь число (например: <code>5</code> или <code>0</code>).", parse_mode="HTML")
-        return
-
-    val = int(text)
-    MONITOR_SETTINGS["max_owner_nft_gifts"] = val
-    save_monitor_settings()
-    await state.clear()
-    await message.answer(f"✅ Лимит NFT сохранён: <b>максимум {val} шт.</b>", parse_mode="HTML")
-    await message.answer(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-
-
-# --- ВЫБОР МОДЕЛЕЙ ---
-
-def monitor_models_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    selected = set(MONITOR_SETTINGS.get("model_ids") or [])
-    start = page * GIFTS_PER_PAGE
-    end = start + GIFTS_PER_PAGE
-    rows = []
-
-    for gift in BASE_GIFTS[start:end]:
-        mark = "✅" if gift.gift_id in selected else "⬜"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{mark} {gift.title}"[:64],
-                callback_data=f"toggle_monitor_model:{page}:{gift.gift_id}",
-            )
-        ])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"monitor_models_page:{page - 1}"))
-    if end < len(BASE_GIFTS):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"monitor_models_page:{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([
-        InlineKeyboardButton(text="✅ ВЫБРАТЬ ВСЕ", callback_data=f"monitor_models_all:{page}"),
-        InlineKeyboardButton(text="⬜ СБРОСИТЬ ВСЕ", callback_data=f"monitor_models_none:{page}"),
-    ])
-    rows.append([InlineKeyboardButton(text="◀️ НАЗАД", callback_data="monitor_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "monitor_models")
-async def monitor_models_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    selected = MONITOR_SETTINGS.get("model_ids") or []
-    await callback.message.edit_text(
-        f"🎁 <b>МОДЕЛИ ДЛЯ МОНИТОРИНГА</b> (Выбрано: {len(selected)})\n\n✅ = парсим, ⬜ = пропускаем.",
-        parse_mode="HTML",
-        reply_markup=monitor_models_keyboard(0),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("monitor_models_page:"))
-async def monitor_models_page_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    page = int(callback.data.split(":")[1])
-    selected = MONITOR_SETTINGS.get("model_ids") or []
-    await callback.message.edit_text(
-        f"🎁 <b>МОДЕЛИ ДЛЯ МОНИТОРИНГА</b> (Выбрано: {len(selected)})\n\n✅ = парсим, ⬜ = пропускаем.",
-        parse_mode="HTML",
-        reply_markup=monitor_models_keyboard(page),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("toggle_monitor_model:"))
-async def toggle_monitor_model_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    _, page_str, gift_id_str = callback.data.split(":")
-    page, gift_id = int(page_str), int(gift_id_str)
-    selected = set(MONITOR_SETTINGS.get("model_ids") or [])
-
-    if gift_id in selected:
-        selected.remove(gift_id)
-    else:
-        selected.add(gift_id)
-
-    MONITOR_SETTINGS["model_ids"] = sorted(selected)
-    save_monitor_settings()
-
+    await get_user(target_id)
+    await add_balance(target_id, amount)
+    await m.answer(f"✅ {target_id}: <b>{amount:+}</b> {CURRENCY}")
     try:
-        await callback.message.edit_text(
-            f"🎁 <b>МОДЕЛИ ДЛЯ МОНИТОРИНГА</b> (Выбрано: {len(selected)})\n\n✅ = парсим, ⬜ = пропускаем.",
-            parse_mode="HTML",
-            reply_markup=monitor_models_keyboard(page),
-        )
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("monitor_models_all"))
-async def monitor_models_all_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    page = int(callback.data.split(":")[1]) if ":" in callback.data else 0
-    MONITOR_SETTINGS["model_ids"] = [g.gift_id for g in BASE_GIFTS]
-    save_monitor_settings()
-    await callback.message.edit_text(
-        f"🎁 <b>МОДЕЛИ МОНИТОРИНГА</b>\n\nВыбраны все {len(BASE_GIFTS)} моделей.",
-        parse_mode="HTML",
-        reply_markup=monitor_models_keyboard(page),
-    )
-    await callback.answer("Выбраны все.")
-
-
-@dp.callback_query(F.data.startswith("monitor_models_none"))
-async def monitor_models_none_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    page = int(callback.data.split(":")[1]) if ":" in callback.data else 0
-    MONITOR_SETTINGS["model_ids"] = []
-    MONITOR_SETTINGS["enabled"] = False
-    save_monitor_settings()
-    await callback.message.edit_text(
-        "🎁 <b>МОДЕЛИ МОНИТОРИНГА</b>\n\nВсе модели сняты. Мониторинг выключен.",
-        parse_mode="HTML",
-        reply_markup=monitor_models_keyboard(page),
-    )
-    await callback.answer("Сброшено.")
-
-
-@dp.callback_query(F.data == "sent_clear")
-async def sent_clear_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    SENT_GIFTS.clear()
-    save_sent_gifts()
-    await callback.answer("🧹 Список отправленных очищен.", show_alert=True)
-    await callback.message.edit_text(monitor_status_text(), parse_mode="HTML", reply_markup=monitor_keyboard())
-
-
-# ============================================================
-# TARGET CHAT, SESSION & BLACKLIST
-# ============================================================
-
-@dp.message(Command("set_target_chat"))
-async def set_target_chat(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    MONITOR_SETTINGS["target_chat_id"] = message.chat.id
-    save_monitor_settings()
-    await message.answer(f"✅ Целевая группа форума привязана!\nChat ID: <code>{message.chat.id}</code>", parse_mode="HTML")
-
-
-@dp.message(Command("add_session"))
-async def add_session_command(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    if await is_user_client_authorized():
-        await message.answer("✅ Сессия уже подключена.")
-        return
-    await state.set_state(AuthState.waiting_phone)
-    await message.answer("📱 Введи номер телефона аккаунта Telethon (например: +79991234567):\n❌ /cancel")
-
-
-@dp.message(AuthState.waiting_phone)
-async def auth_phone(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    phone = (message.text or "").strip()
-    if not phone.startswith("+"):
-        phone = "+" + phone
-    await ensure_user_client_connected()
-    try:
-        await user_client.send_code_request(phone)
-        await state.update_data(phone=phone)
-        await state.set_state(AuthState.waiting_code)
-        await message.answer("✅ Код подтверждения отправлен в Telegram. Введи код:")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка отправки кода: {e}")
-
-
-@dp.message(AuthState.waiting_code)
-async def auth_code(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    code = "".join(ch for ch in (message.text or "").strip() if ch.isdigit())
-    data = await state.get_data()
-    try:
-        await user_client.sign_in(phone=data.get("phone"), code=code)
-        await state.clear()
-        await message.answer("✅ Сессия авторизована! Загружаю модели подарков...")
-        await load_base_gifts()
-        await message.answer(f"Готово. Доступно моделей: {len(BASE_GIFTS)}")
-    except SessionPasswordNeededError:
-        await state.set_state(AuthState.waiting_password)
-        await message.answer("🔐 На аккаунте включён 2FA. Введи пароль от облачного пароля:")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка входа: {e}")
-
-
-@dp.message(AuthState.waiting_password)
-async def auth_password(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        await user_client.sign_in(password=(message.text or "").strip())
-        await state.clear()
-        await message.answer("✅ 2FA успешно пройдена! Загружаю модели...")
-        await load_base_gifts()
-        await message.answer(f"Готово. Загружено моделей: {len(BASE_GIFTS)}")
-    except Exception as e:
-        await message.answer(f"❌ Неверный пароль: {e}")
-
-
-@dp.callback_query(F.data == "blacklist")
-async def show_blacklist(callback: CallbackQuery):
-    items = list(OWNERS_BLACKLIST.items())
-    text = "🚫 <b>ЧЁРНЫЙ СПИСОК ПУСТ</b>" if not items else f"🚫 <b>ЧЁРНЫЙ СПИСОК</b> ({len(items)})"
-    rows = []
-    for key, label in items[:20]:
-        rows.append([InlineKeyboardButton(text=f"❌ {label}"[:64], callback_data=f"unban:{key}"[:64])])
-    if is_admin(callback.from_user.id):
-        rows.append([InlineKeyboardButton(text="➕ ДОБАВИТЬ В ЧС", callback_data="blacklist_add")])
-        rows.append([InlineKeyboardButton(text="🧹 ОЧИСТИТЬ ВСЁ", callback_data="blacklist_clear")])
-    rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "blacklist_add")
-async def blacklist_add(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(BlacklistState.waiting_value)
-    await callback.message.answer("🚫 Введи <b>@username</b> или числовой <b>user_id</b> продавца:\n❌ /cancel", parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.message(BlacklistState.waiting_value)
-async def blacklist_add_value(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    raw = (message.text or "").strip()
-    if not raw:
-        return
-    if raw.startswith("@"):
-        key = f"username:{raw[1:].lower()}"
-        label = raw
-    elif raw.lstrip("-").isdigit():
-        key = f"id:{int(raw)}"
-        label = key
-    else:
-        await message.answer("❌ Нужен @username или числовой user_id.")
-        return
-
-    OWNERS_BLACKLIST[key] = label
-    save_owner_blacklist()
-    await state.clear()
-    await message.answer(f"✅ Добавлен в ЧС: <code>{key}</code>", parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("unban:"))
-async def unban_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    key = callback.data.split(":", 1)[1]
-    OWNERS_BLACKLIST.pop(key, None)
-    save_owner_blacklist()
-    await callback.answer(f"✅ Удалено: {key}")
-    await show_blacklist(callback)
-
-
-@dp.callback_query(F.data == "blacklist_clear")
-async def clear_blacklist(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    OWNERS_BLACKLIST.clear()
-    save_owner_blacklist()
-    await callback.answer("🧹 ЧС очищен.")
-    await show_blacklist(callback)
-
-
-# ============================================================
-# MANUAL SEARCH & ADMIN PANEL
-# ============================================================
-
-def models_keyboard(page: int = 0, mode: str = "manual") -> InlineKeyboardMarkup:
-    total = len(BASE_GIFTS)
-    start = page * GIFTS_PER_PAGE
-    end = start + GIFTS_PER_PAGE
-    rows = []
-
-    for gift in BASE_GIFTS[start:end]:
-        text = gift.title
-        if gift.resell_min_stars:
-            text += f" · от {gift.resell_min_stars}⭐"
-        rows.append([InlineKeyboardButton(text=text[:64], callback_data=f"gift_{mode}:{gift.gift_id}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"models_{mode}:{page - 1}"))
-    if end < total:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"models_{mode}:{page + 1}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "manual_parse")
-async def manual_parse(callback: CallbackQuery):
-    if not await is_user_client_authorized():
-        await callback.answer("Сессия не авторизована.", show_alert=True)
-        return
-    await ensure_models_loaded()
-    await callback.message.edit_text("🔎 <b>РУЧНОЙ ПОИСК</b>\n\nВыбери модель:", parse_mode="HTML", reply_markup=models_keyboard(0, "manual"))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("models_manual:"))
-async def models_manual_page(callback: CallbackQuery):
-    page = int(callback.data.split(":")[1])
-    await callback.message.edit_text("🔎 <b>РУЧНОЙ ПОИСК</b>\n\nВыбери модель:", parse_mode="HTML", reply_markup=models_keyboard(page, "manual"))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("gift_manual:"))
-async def gift_manual(callback: CallbackQuery):
-    gift_id = int(callback.data.split(":")[1])
-    USER_SELECTED_GIFT[callback.from_user.id] = gift_id
-    gift = BASE_GIFTS_BY_ID.get(gift_id)
-    if not gift:
-        return
-    await callback.message.edit_text(
-        f"✅ <b>{escape_text(gift.title)}</b>\n💰 Мин. цена: {gift.resell_min_stars or 0}⭐\n"
-        f"📦 На маркете: {gift.availability_resale} шт.\n\nОтправь диапазон цен (например: <code>500 5000</code>):",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    is_auth = await is_user_client_authorized()
-    me = await user_client.get_me() if is_auth else None
-    account = f"{me.first_name} (@{me.username})" if me else "—"
-
-    await callback.message.edit_text(
-        "⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-        f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
-        f"👤 Аккаунт: {escape_text(account)}\n"
-        f"📦 Моделей в базе: {len(BASE_GIFTS)}\n"
-        f"🚫 В blacklist: {len(OWNERS_BLACKLIST)}\n"
-        f"📤 Отправлено: {len(SENT_GIFTS)}\n"
-        f"📂 Тем форума: {len(TOPICS_CACHE)}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
-                [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
-                [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")],
-            ]
-        ),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "reload_models")
-async def reload_models_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    await callback.answer("Загрузка моделей...")
-    await load_base_gifts()
-    await callback.message.edit_text(f"✅ Модели обновлены. Доступно: {len(BASE_GIFTS)}", reply_markup=main_menu_keyboard(callback.from_user.id))
-
-
-@dp.callback_query(F.data == "add_session_btn")
-async def add_session_btn(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    await state.set_state(AuthState.waiting_phone)
-    await callback.message.answer("📱 Введи номер телефона (пример: +79991234567):\n❌ /cancel")
-    await callback.answer()
-
-
-@dp.message(Command("cancel"))
-async def cancel_command(message: Message, state: FSMContext):
-    await state.clear()
-    USER_SELECTED_GIFT.pop(message.from_user.id, None)
-    await message.answer("❌ Отменено.")
-
-
-@dp.message()
-async def generic_message_handler(message: Message, state: FSMContext):
-    if await state.get_state() is not None:
-        return
-
-    user_id = message.from_user.id
-    if user_id not in USER_SELECTED_GIFT:
-        return
-
-    parts = (message.text or "").strip().replace("-", " ").split()
-    if len(parts) != 2:
-        await message.answer("❌ Введи два числа: <code>500 5000</code>", parse_mode="HTML")
-        return
-
-    try:
-        min_p, max_p = int(parts[0]), int(parts[1])
-        if min_p < 0 or max_p < 0 or min_p > max_p:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Некорректный диапазон цен.")
-        return
-
-    gift_id = USER_SELECTED_GIFT.pop(user_id)
-    base = BASE_GIFTS_BY_ID.get(gift_id)
-    if not base:
-        return
-
-    status = await message.answer(f"⏳ Поиск {escape_text(base.title)} ({min_p}—{max_p}⭐)...")
-    results = await find_market_gifts(gift_id=gift_id, min_price=min_p, max_price=max_p, need=10)
-
-    try:
-        await status.delete()
+        await bot.send_message(target_id, f"💰 Администратор начислил тебе <b>{fmt(amount)} {CURRENCY}</b>")
     except Exception:
         pass
 
-    if not results:
-        await message.answer(f"❌ Ничего не найдено для {escape_text(base.title)} в диапазоне {min_p}—{max_p}⭐")
+
+@dp.message(Command("takebal"))
+async def cmd_takebal(m: Message):
+    if not is_admin(m):
         return
+    parts = (m.text or "").split()
+    if len(parts) != 3:
+        await m.answer("Формат: <code>/takebal user_id сумма</code>")
+        return
+    target_id = await resolve_target_id(parts[1])
+    if not target_id:
+        await m.answer("❌ Юзер не найден")
+        return
+    try:
+        amount = int(parts[2])
+    except ValueError:
+        await m.answer("Сумма — число")
+        return
+    await get_user(target_id)
+    await add_balance(target_id, -amount)
+    await m.answer(f"✅ {target_id}: <b>-{amount}</b> {CURRENCY}")
 
-    text = f"<b>{escape_text(base.title)}</b> (найдено: {len(results)}):\n\n"
-    for i, g in enumerate(results, 1):
-        text += (
-            f"{i}. #{g.num} — <b>{g.price} ⭐</b>\n"
-            f"👤 {escape_text(g.owner.display)} (Рейтинг: lvl {g.owner.rating_level}, NFT в профиле: {g.owner.nft_gifts_count})\n"
-            f"🔗 {escape_text(g.link)}\n\n"
-        )
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+
+@dp.message(Command("setbal"))
+async def cmd_setbal(m: Message):
+    if not is_admin(m):
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 3:
+        await m.answer("Формат: <code>/setbal user_id сумма</code>")
+        return
+    target_id = await resolve_target_id(parts[1])
+    if not target_id:
+        await m.answer("❌ Юзер не найден")
+        return
+    try:
+        amount = int(parts[2])
+    except ValueError:
+        await m.answer("Сумма — число")
+        return
+    await get_user(target_id)
+    await set_balance(target_id, amount)
+    await m.answer(f"✅ {target_id} = <b>{fmt(amount)}</b> {CURRENCY}")
 
 
-# ============================================================
-# MAIN
-# ============================================================
+@dp.message(Command("giveall"))
+async def cmd_giveall(m: Message):
+    if not is_admin(m):
+        return
+    parts = (m.text or "").split()
+    if len(parts) != 2:
+        await m.answer("Формат: <code>/giveall сумма</code>")
+        return
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        await m.answer("Сумма — число")
+        return
+    n = await give_all(amount)
+    await m.answer(f"✅ Всем <b>{n}</b> юзерам начислено: <b>{amount:+}</b> {CURRENCY}")
+
+
+# ==================== ПРОВЕРКА ПОДПИСКИ ПО КНОПКЕ ====================
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(cq: CallbackQuery):
+    if not await is_subscribed(cq.from_user.id):
+        await cq.answer("Ты ещё не подписан!", show_alert=True)
+        return
+    u = await get_user(cq.from_user.id, cq.from_user.username, cq.from_user.first_name)
+    if not u["sub_rewarded"]:
+        await add_balance(cq.from_user.id, SUBSCRIBE_REWARD)
+        await mark_sub_rewarded(cq.from_user.id)
+        await cq.answer(f"+{SUBSCRIBE_REWARD} {CURRENCY} за подписку!", show_alert=True)
+    if cq.message.chat.type == ChatType.PRIVATE:
+        await render_menu(cq, edit=True)
+    else:
+        await cq.answer("Подписка подтверждена!")
+
+
+# ==================== ЧАТ-СЛУШАТЕЛЬ ====================
+
+@dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def chat_listener(m: Message):
+    if await handle_reply_pay(m):
+        return
+    if await handle_chat_balance(m):
+        return
+    await handle_chat_trigger(m)
+
+
+# ==================== ЗАПУСК БОТА ====================
+
+@dp.shutdown()
+async def on_shutdown():
+    if _pg_pool:
+        await _pg_pool.close()
+        print("[pg] пул закрыт")
+
 
 async def main():
-    global OWNERS_BLACKLIST, OWNER_CACHE, SENT_GIFTS, TOPICS_CACHE
-
-    validate_config()
-
-    OWNERS_BLACKLIST = load_owner_blacklist()
-    OWNER_CACHE = load_owner_cache()
-    SENT_GIFTS = load_sent_gifts()
-    TOPICS_CACHE = load_topics()
-    load_monitor_settings()
-
-    log.info(
-        "Данные загружены: ЧС=%s, кэш=%s, отправлено=%s, тем=%s",
-        len(OWNERS_BLACKLIST), len(OWNER_CACHE), len(SENT_GIFTS), len(TOPICS_CACHE),
-    )
-
-    await ensure_user_client_connected()
-
-    if await is_user_client_authorized():
-        me = await user_client.get_me()
-        log.info("Сессия Telethon активна: %s (@%s)", me.first_name, me.username)
-        await ensure_models_loaded()
-        if MONITOR_SETTINGS.get("enabled") and get_target_chat_id():
-            await start_monitor()
-    else:
-        log.warning("Сессия Telethon не авторизована. Напиши боту /add_session")
-
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
-    log.info("Бот запущен в режиме polling.")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await stop_monitor()
-        if user_client.is_connected():
-            await user_client.disconnect()
-        await bot.session.close()
+    await init_db()
+    print(f"Казино screamsoon успешно запущено 🎰 [{DB_BACKEND}]")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
