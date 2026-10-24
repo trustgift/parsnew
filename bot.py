@@ -1,6 +1,4 @@
-# bot.py — казик screamsoon, .env + sqlite/postgres
-# pip install aiogram aiosqlite asyncpg python-dotenv
-
+# bot.py — screamsoon casino
 import asyncio
 import functools
 import html
@@ -15,7 +13,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ============ CONFIG ИЗ ENV ============
+# ============ КОНФИГУРАЦИЯ ИЗ .ENV ============
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -28,16 +26,13 @@ SUBSCRIBE_REWARD = int(os.getenv("SUBSCRIBE_REWARD", "500"))
 START_BALANCE = int(os.getenv("START_BALANCE", "0"))
 MINES_COUNT = int(os.getenv("MINES_COUNT", "5"))
 
-DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
+DB_BACKEND = os.getenv("DB_BACKEND", "postgres").lower()
 DB_PATH = os.getenv("DB_PATH", "screamsoon.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-PG_SSL = os.getenv("PG_SSL", "disable").lower()
 
 CURRENCY = "scream"
 
-# ============ ТЕЛЕГРАМ ПРЕМИУМ ЭМОДЗИ (ID) ============
-# Вписывай числовой custom_emoji_id нужного премиум-эмодзи в кавычки.
-# Если оставить "" (пустым) — в чат пойдет обычный смайлик.
+# ============ ПРЕМИУМ ЭМОДЗИ TELEGRAM ============
 PREMIUM_EMOJIS = {
     "casino":   "5431536464246634160",  # 🎰 Главный значок казика
     "fire":     "5188487846968732572",  # 🔥 Огонь / статус Профи
@@ -66,7 +61,7 @@ PREMIUM_EMOJIS = {
 
 
 def e(key: str, fallback: str) -> str:
-    """Генерирует HTML тег для Telegram Premium эмодзи или отдает fallback."""
+    """Генерирует HTML-тег для премиум-эмодзи Телеграма."""
     custom_id = PREMIUM_EMOJIS.get(key, "").strip()
     if custom_id:
         return f'<tg-emoji id="{custom_id}">{fallback}</tg-emoji>'
@@ -74,9 +69,9 @@ def e(key: str, fallback: str) -> str:
 
 
 if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN не задан в .env")
+    raise SystemExit("Ошибка: BOT_TOKEN не задан в .env файле!")
 
-# ========================================================
+# ================================================
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -94,7 +89,7 @@ dp = Dispatcher()
 
 Event = Union[Message, CallbackQuery]
 
-# ==================== СЛОЙ БАЗЫ ДАННЫХ ====================
+# ==================== БАЗА ДАННЫХ ====================
 
 import aiosqlite
 
@@ -112,7 +107,6 @@ def _is_pg() -> bool:
 
 
 def _strip_url(url: str) -> str:
-    """Убираем ?sslmode=... и лишние префиксы SQLAlchemy."""
     if "+asyncpg" in url:
         url = url.replace("postgresql+asyncpg://", "postgresql://")
     if "?" in url:
@@ -123,39 +117,19 @@ def _strip_url(url: str) -> str:
 async def _pg_init_pool():
     global _pg_pool
     if not HAS_PG:
-        raise SystemExit("DB_BACKEND=postgres, но asyncpg не установлен")
+        raise SystemExit("Установлен DB_BACKEND=postgres, но библиотека asyncpg не установлена!")
     if not DATABASE_URL:
-        raise SystemExit("DATABASE_URL не задан")
+        raise SystemExit("DATABASE_URL не задан в .env файле!")
 
     clean_url = _strip_url(DATABASE_URL)
-
     _pg_pool = await asyncpg.create_pool(
         clean_url,
         min_size=1,
         max_size=10,
-        ssl=False,
+        ssl=False,  # Отключаем SSL для серверов без ssl upgrade
         command_timeout=30,
     )
-    print("[pg] подключение к базе успешно установлено!")
-
-    # SSL отключаем, если сервер pghost.ru не держит ssl upgrade
-    if PG_SSL in ("disable", "false", "off", "0", "no"):
-        ssl_arg = False
-    elif PG_SSL in ("require", "true", "on", "1"):
-        ssl_arg = "require"
-    else:
-        ssl_arg = False
-
-    clean_url = _strip_url(DATABASE_URL)
-
-    _pg_pool = await asyncpg.create_pool(
-        clean_url,
-        min_size=1,
-        max_size=10,
-        ssl=ssl_arg,
-        command_timeout=30,
-    )
-    print(f"[pg] пул подключений создан (ssl={ssl_arg})")
+    print("[БД] Успешное подключение к PostgreSQL!")
 
 
 def _pg_conn():
@@ -198,7 +172,7 @@ async def _x(sql: str, *args) -> None:
             await db.commit()
 
 
-# ==================== ТАБЛИЦЫ И СХЕМА ====================
+# ==================== ТАБЛИЦЫ ====================
 
 SQLITE_SCHEMA_USERS = """
     CREATE TABLE IF NOT EXISTS users (
@@ -283,7 +257,6 @@ async def init_db():
             for col, decl in needed.items():
                 if col not in existing:
                     await conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
-                    print(f"[migrate] users.{col} добавлена")
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(SQLITE_SCHEMA_USERS)
@@ -308,11 +281,10 @@ async def init_db():
             for col, decl in needed.items():
                 if col not in existing:
                     await db.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
-                    print(f"[migrate] users.{col} добавлена")
             await db.commit()
 
 
-# ==================== ОПЕРАЦИИ С БАЗОЙ ====================
+# ==================== ОПЕРАЦИИ БАЗЫ ====================
 
 async def get_user(user_id: int, username: Optional[str] = None,
                    first_name: Optional[str] = None) -> dict:
@@ -331,10 +303,7 @@ async def get_user(user_id: int, username: Optional[str] = None,
             updates.append("first_name=?"); params.append(first_name)
         if updates:
             params.append(user_id)
-            await _x(
-                f"UPDATE users SET {', '.join(updates)} WHERE user_id=?",
-                *params,
-            )
+            await _x(f"UPDATE users SET {', '.join(updates)} WHERE user_id=?", *params)
     rows = await _q("SELECT * FROM users WHERE user_id=?", user_id)
     return rows[0]
 
@@ -344,7 +313,6 @@ async def add_balance(user_id: int, amount: int) -> None:
 
 
 async def try_deduct_balance(user_id: int, amount: int) -> bool:
-    """Атомарное списание средств с проверкой наличия нужного баланса."""
     if amount <= 0:
         return True
     if _is_pg():
@@ -424,7 +392,6 @@ async def get_game(user_id: int) -> Optional[dict]:
     if not rows:
         return None
     g = rows[0]
-    # Защита от зависших игр: если прошло > 15 минут — автосброс
     now = int(time.time())
     if now - g.get("created_at", 0) > 900:
         await delete_game(user_id)
@@ -501,7 +468,7 @@ async def show_alert(event: CallbackQuery, text: str) -> None:
     await event.answer(text, show_alert=True)
 
 
-# ==================== ПРОВЕРКА ПОДПИСКИ ====================
+# ==================== ПОДПИСКА ====================
 
 def get_channel_handle() -> str:
     return REQUIRED_CHANNEL.replace("https://t.me/", "").replace("t.me/", "").lstrip("@").strip()
@@ -524,7 +491,7 @@ def sub_keyboard() -> InlineKeyboardMarkup:
             text=f"📢 Подписаться на @{handle}",
             url=f"https://t.me/{handle}",
         )],
-        [InlineKeyboardButton(text=f"{e('check', '✅')} Я подписался", callback_data="check_sub")],
+        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
     ])
 
 
@@ -552,7 +519,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
          InlineKeyboardButton(text="🎁 Бонус", callback_data="menu:bonus")],
         [InlineKeyboardButton(text="💸 Перевод", callback_data="menu:pay"),
-         InlineKeyboardButton(text="💎 Купить валюту", callback_data="menu:buy")],
+         InlineKeyboardButton(text="💎 Купить scream", callback_data="menu:buy")],
     ])
 
 
@@ -566,12 +533,12 @@ async def render_menu(event: Event, edit: bool = True) -> None:
         f"👤 <b>{html.escape(event.from_user.first_name or 'anon')}</b> "
         f"[{user_title(u['games_played'], u['games_won'])}]\n"
         f"{e('bag', '💼')} Баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>\n\n"
-        f"👇 Выбирай, во что залететь:"
+        f"👇 Выбирай режим:"
     )
     await show(event, text, main_menu_kb(), edit=edit)
 
 
-# ==================== МИНЫ ====================
+# ==================== ИГРА 1: МИНЫ ====================
 
 MINES_GRID = 5
 MINES_TOTAL = MINES_GRID * MINES_GRID
@@ -634,7 +601,7 @@ def mines_text(state: dict, result: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
-# ==================== ДЖОКЕР ====================
+# ==================== ИГРА 2: ДЖОКЕР ====================
 
 JOKER_COLS = 3
 JOKER_HOUSE_EDGE = 0.97
@@ -867,7 +834,7 @@ async def cb_buy(cq: CallbackQuery):
         f"└ <b>10 000 {CURRENCY}</b> = <b>10 ₽</b> или <b>10 ⭐</b>\n"
         f"└ <b>50 000 {CURRENCY}</b> = <b>45 ₽</b> или <b>45 ⭐</b>\n"
         f"└ <b>100 000 {CURRENCY}</b> = <b>80 ₽</b> или <b>80 ⭐</b>\n\n"
-        f"✍️ Писать лично создателю: @{ADMIN_USERNAME}\n"
+        f"✍️ Писать лично владельцу: @{ADMIN_USERNAME}\n"
         f"└ Укажи сколько валюты надо и способ оплаты\n\n"
         f"{e('fire', '🔥')} Валюта выдается сразу после подтверждения.",
         buy_kb())
@@ -907,7 +874,7 @@ async def cb_menu_joker(cq: CallbackQuery):
         [home_button()],
     ])
     await show(cq,
-        f"{e('joker', '🃏')} <b>ДЖОКЕР</b>\n"
+        f"{e('joker', '🃏')} <b>ДЖОКЕР (SCREAMSOON)</b>\n"
         f"└ В каждой строке: 2 карты Джокера и 1 Череп\n"
         f"└ Нашёл Джокера — уровень пройден, куш растёт!\n"
         f"└ Череп — ставка сгорает!\n\n"
@@ -920,10 +887,10 @@ async def cb_menu_dice(cq: CallbackQuery):
     if not await gate(cq):
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎲 100", callback_data="dice:new:100"),
-         InlineKeyboardButton(text="🎲 500", callback_data="dice:new:500")],
-        [InlineKeyboardButton(text="🎲 1 000", callback_data="dice:new:1000"),
-         InlineKeyboardButton(text="🎲 5 000", callback_data="dice:new:5000")],
+        [InlineKeyboardButton(text=f"🎲 100 {CURRENCY}", callback_data="dice:new:100"),
+         InlineKeyboardButton(text=f"🎲 500 {CURRENCY}", callback_data="dice:new:500")],
+        [InlineKeyboardButton(text=f"🎲 1 000 {CURRENCY}", callback_data="dice:new:1000"),
+         InlineKeyboardButton(text=f"🎲 5 000 {CURRENCY}", callback_data="dice:new:5000")],
         [home_button()],
     ])
     await show(cq,
@@ -945,7 +912,7 @@ async def cb_menu_cases(cq: CallbackQuery):
     await cq.answer()
 
 
-# ==================== ПРОЦЕСС ИГРЫ: МИНЫ ====================
+# ==================== ХОД ИГРЫ: МИНЫ ====================
 
 @dp.callback_query(F.data.startswith("mines:new:"))
 async def cb_mines_new(cq: CallbackQuery):
@@ -976,7 +943,6 @@ async def cb_mine(cq: CallbackQuery):
     owner_id = int(parts[1])
     action = parts[2]
 
-    # Защита от чужих нажатий в беседах
     if cq.from_user.id != owner_id:
         await cq.answer("🚫 Это не твоя игра!", show_alert=True)
         return
@@ -1032,7 +998,7 @@ async def cb_mine(cq: CallbackQuery):
     await cq.answer()
 
 
-# ==================== ПРОЦЕСС ИГРЫ: ДЖОКЕР ====================
+# ==================== ХОД ИГРЫ: ДЖОКЕР ====================
 
 @dp.callback_query(F.data.startswith("joker:new:"))
 async def cb_joker_new(cq: CallbackQuery):
@@ -1122,7 +1088,7 @@ async def cb_joker_pick(cq: CallbackQuery):
     await cq.answer(f"x{joker_multiplier(len(state['rounds']))}")
 
 
-# ==================== ПРОЦЕСС ИГРЫ: КОСТИ ====================
+# ==================== ХОД ИГРЫ: КОСТИ ====================
 
 @dp.callback_query(F.data.startswith("dice:new:"))
 async def cb_dice_new(cq: CallbackQuery):
@@ -1167,14 +1133,14 @@ async def cb_dice_new(cq: CallbackQuery):
         )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🎲 Ещё на {bet}", callback_data=f"dice:new:{bet}")],
+        [InlineKeyboardButton(text=f"🎲 Ещё на {bet} {CURRENCY}", callback_data=f"dice:new:{bet}")],
         [home_button()],
     ])
     await show(cq, f"{e('dice', '🎲')} <b>КОСТИ (SCREAMSOON)</b>\n\n{res}", kb)
     await cq.answer()
 
 
-# ==================== ПРОЦЕСС ИГРЫ: КЕЙСЫ ====================
+# ==================== ХОД ИГРЫ: КЕЙСЫ ====================
 
 @dp.callback_query(F.data.startswith("case:"))
 async def cb_case(cq: CallbackQuery):
@@ -1211,7 +1177,7 @@ async def cb_case(cq: CallbackQuery):
     await cq.answer()
 
 
-# ==================== ЧАТ: ПЕРЕВОД РЕПЛАЕМ ====================
+# ==================== ПЕРЕВОД РЕПЛАЕМ В ЧАТЕ ====================
 
 PAY_RE = re.compile(r"^\s*(?:п|pay|перевод|перевести)\s+(\d+)\s*$", re.IGNORECASE)
 
@@ -1255,7 +1221,7 @@ async def handle_reply_pay(m: Message) -> bool:
     return True
 
 
-# ==================== ЧАТ: БАЛАНС ====================
+# ==================== БАЛАНС В ЧАТЕ ====================
 
 BAL_RE = re.compile(r"^\s*(?:б|бал|баланс|bal|balance)\s*$", re.IGNORECASE)
 
@@ -1274,7 +1240,7 @@ async def handle_chat_balance(m: Message) -> bool:
     return True
 
 
-# ==================== ЧАТ: ТРИГГЕРЫ И КОМАНДЫ ====================
+# ==================== ТРИГГЕРЫ И КОМАНДЫ ЧАТА ====================
 
 TRIGGER_RE = re.compile(
     r"^\s*(джокер|джок|joker|мины|мина|mines|кейс|кейсы|case|кеис|кости|dice)\b(.*)$",
@@ -1447,7 +1413,7 @@ async def cmd_pay(m: Message):
         return
     parts = (m.text or "").split()
     if len(parts) != 3 or not parts[2].isdigit():
-        await m.answer("Формат: <code>/pay @ник сумма</code>")
+        await m.answer(f"Формат: <code>/pay @ник сумма</code>")
         return
     target_username = parts[1].lstrip("@")
     amount = int(parts[2])
@@ -1512,10 +1478,10 @@ async def cmd_give(m: Message):
 
     if len(parts) != 3:
         await m.answer(
-            "Формат:\n"
-            "└ <code>/give user_id 5000</code>\n"
-            "└ <code>/give @username 5000</code>\n"
-            "└ реплай + <code>/give 5000</code>")
+            f"Формат:\n"
+            f"└ <code>/give user_id 5000</code>\n"
+            f"└ <code>/give @username 5000</code>\n"
+            f"└ реплай + <code>/give 5000</code>")
         return
     target_id = await resolve_target_id(parts[1])
     if not target_id:
@@ -1625,13 +1591,13 @@ async def chat_listener(m: Message):
     await handle_chat_trigger(m)
 
 
-# ==================== ЗАПУСК БОТА ====================
+# ==================== ЗАПУСК ====================
 
 @dp.shutdown()
 async def on_shutdown():
     if _pg_pool:
         await _pg_pool.close()
-        print("[pg] пул закрыт")
+        print("[БД] Пул соединений закрыт.")
 
 
 async def main():
