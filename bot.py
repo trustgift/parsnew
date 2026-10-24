@@ -127,6 +127,17 @@ async def _pg_init_pool():
     if not DATABASE_URL:
         raise SystemExit("DATABASE_URL не задан")
 
+    clean_url = _strip_url(DATABASE_URL)
+
+    _pg_pool = await asyncpg.create_pool(
+        clean_url,
+        min_size=1,
+        max_size=10,
+        ssl=False,
+        command_timeout=30,
+    )
+    print("[pg] подключение к базе успешно установлено!")
+
     # SSL отключаем, если сервер pghost.ru не держит ssl upgrade
     if PG_SSL in ("disable", "false", "off", "0", "no"):
         ssl_arg = False
